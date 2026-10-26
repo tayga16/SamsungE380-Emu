@@ -1,0 +1,4 @@
+Samsung E830 Emulator contains code derived from the user's PocketHLE E830
+source handoff. The E830 board, firmware validation, experimental QEMU machine
+and desktop presentation layout retain their original Apache-2.0/MIT licensing.
+See LICENSE, LICENSE-APACHE and LICENSE-MIT for the original license terms.

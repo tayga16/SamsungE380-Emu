@@ -1,0 +1,39 @@
+[package]
+name = "samsung-e830-emulator"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+description = "Experimental Samsung SGH-E830 firmware emulator"
+
+[lib]
+name = "e830"
+
+[[bin]]
+name = "e830-emulator"
+path = "src/main.rs"
+
+[[bin]]
+name = "e830-cli"
+path = "src/cli.rs"
+
+[[bin]]
+name = "onenand-loader-probe"
+path = "tools/onenand-loader-probe.rs"
+test = false
+
+[dependencies]
+anyhow = "1"
+thiserror = "1"
+clap = { version = "4", features = ["derive"] }
+unicorn-engine = { version = "=2.1.5", default-features = false, features = ["arch_arm"] }
+eframe = { version = "0.27", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+rfd = { version = "0.14", default-features = false, features = ["gtk3"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.dev]
+opt-level = 1
