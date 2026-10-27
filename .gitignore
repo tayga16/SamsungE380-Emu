@@ -3,10 +3,19 @@
 /.tools/
 /firmware/
 /proof/
+/research/
+/e830-config.json
+
+__pycache__/
+*.pyc
+*.log
 
 *.cla
 *.nsf
 *.tfs
+*.cfg
+*.def
+*.bin
 *.onenand.bin
 *.nand.bin
 *.ram.bin
@@ -17,3 +26,9 @@
 *.exp
 *.lib
 *.exe
+*.dll
+*.elf
+*.axf
+*.out
+*.zip
+*.7z

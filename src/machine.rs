@@ -19,6 +19,7 @@ const E830_BOOT_ROM_MIRROR_BASE: u64 = 0xea00_0000;
 // Auxiliary DSP data window; the physical size still needs verification.
 const DSP_AUX_RAM_BASE: u64 = 0x6010_0000;
 const DSP_AUX_RAM_SIZE: u64 = 0x0040_0000;
+const DSP_BOOT_MMIO_SIZE: u64 = PAGE_SIZE;
 // Shared DSP data/mailbox addresses used by the firmware (including
 // 0x60000008 and 0x600007e0). Storage only; DSP execution is not implemented.
 const DSP_SHARED_RAM_BASE: u64 = 0x6000_0000;
@@ -41,6 +42,7 @@ const SOC_SECONDARY_REGISTER_SIZE: u64 = 0x0001_0000;
 const UART_BASES: [u32; 2] = [0x5040_3000, 0x5040_4000];
 const I2C_BASE: u32 = 0x5040_5000;
 const I2C_IRQ: u32 = 28;
+const SYSTEM_TIMER_IRQ: u32 = 20;
 const SOC_POWER_CONTROL_BASE: u64 = 0x5010_0000;
 const SOC_POWER_CONTROL_SIZE: u64 = 0x0001_0000;
 const SOC_REGISTER_BASE: u64 = 0x5050_0000;
@@ -52,6 +54,31 @@ pub const LCD_HEIGHT: usize = 220;
 const LCD_PIXEL_COUNT: usize = LCD_WIDTH * LCD_HEIGHT;
 const LCD_GRAM_REGISTER: u16 = 0x22;
 const SOC_TIMER: u32 = 0x5050_1000;
+const SYSTEM_TIMER_BOOKKEEPING_START: u64 = 0x3001_a4f4;
+const SYSTEM_TIMER_BOOKKEEPING_END: u64 = 0x3001_a4f7;
+const RTOS_GLOBALS_TRACE_START: u64 = 0x3090_0160;
+const RTOS_GLOBALS_TRACE_END: u64 = 0x3090_01bf;
+const RTOS_NESTING_DEPTH: u64 = 0x3090_0169;
+const DSP_CONTROL_BASE: u64 = 0x6010_0000;
+const DSP_MAILBOX_BASE: u64 = 0x6000_0640;
+const DSP_TRACE_PCS: [u64; 10] = [
+    0x2098_c180,
+    0x2098_c188,
+    0x2098_c214,
+    0x2098_c220,
+    0x2118_f212,
+    0x2118_f21e,
+    0x2118_f252,
+    0x2118_f260,
+    0x2118_f294,
+    0x2118_f2a2,
+];
+const RTOS_GLOBALS_TRACE_TARGETS: [(u64, u64); 4] = [
+    (0x3090_0170, 0x3090_0173),
+    (0x3090_018c, 0x3090_018f),
+    (0x3090_01a0, 0x3090_01a3),
+    (0x3090_01b8, 0x3090_01bb),
+];
 const SOC_INIT_CONTROL_REGISTER: u32 = 0x5030_2008;
 const SOC_INIT_STATUS_REGISTER: u32 = 0x5030_2004;
 const SOC_BOOT_READY_INPUT_REGISTER: u32 = 0x5030_3050;
@@ -94,6 +121,35 @@ const CPSR_THUMB: u32 = 1 << 5;
 // real peripheral interrupts are driven by their devices. Respect both masks.
 const DEFAULT_TIMER_IRQ_INDEX: u32 = 29;
 const DEFAULT_TIMER_IRQ_PERIOD: u64 = 0;
+const WAKE_MMIO_START: u32 = 0x5050_0000;
+const WAKE_MMIO_END: u32 = 0x5050_2018;
+const WAKE_STATE_START: u64 = 0x304a_20d4;
+const WAKE_STATE_END: u64 = 0x304a_2104;
+const WAKE_STUB_START: u64 = 0x31f0_0000;
+const WAKE_STUB_END: u64 = 0x31f0_01ab;
+const WAKE_WAIT_TRACE_START: u64 = 0x2012_179c;
+const WAKE_WAIT_TRACE_END: u64 = 0x2012_17d6;
+const WAKE_IRQ_TRACE_PCS: [u64; 10] = [
+    IRQ_VECTOR_TARGET,
+    0x2012_1498,
+    0x31f0_0140,
+    0x208a_0fd8,
+    0x2001_0bb2,
+    0x2001_3d08,
+    0x2001_0a40,
+    0x2001_40cc,
+    0x2001_07e8,
+    0x20d7_29c0,
+];
+const TIMER_TRACE_PCS: [u64; 7] = [
+    0x2001_172c,
+    0x2001_17d4,
+    0x200e_8cd0,
+    0x200e_8d08,
+    0x2013_e2e8,
+    0x2084_8732,
+    IRQ_VECTOR_TARGET,
+];
 
 fn env_u64(name: &str) -> Option<u64> {
     let raw = std::env::var(name).ok()?;
@@ -181,8 +237,187 @@ pub struct BootReport {
     pub irqs_taken: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DspBootParser {
+    Command,
+    Running,
+    Arguments {
+        command: u16,
+        address: Option<u16>,
+    },
+    Upload {
+        memory_space: u8,
+        address: u16,
+        remaining: u16,
+    },
+}
+
+#[derive(Debug)]
+struct DspBootInterface {
+    control: u32,
+    last_tx: u16,
+    auxiliary: u32,
+    parser: DspBootParser,
+    rx_fifo: VecDeque<u16>,
+    memories: [HashMap<u16, u16>; 2],
+}
+
+impl Default for DspBootInterface {
+    fn default() -> Self {
+        Self {
+            control: 0,
+            last_tx: 0,
+            auxiliary: 0,
+            parser: DspBootParser::Command,
+            rx_fifo: VecDeque::new(),
+            memories: Default::default(),
+        }
+    }
+}
+
+impl DspBootInterface {
+    const TX_READY: u32 = 1 << 0;
+    const RX_READY: u32 = 1 << 1;
+
+    fn status(&self) -> u32 {
+        (self.control & !(Self::TX_READY | Self::RX_READY))
+            | Self::TX_READY
+            | if self.rx_fifo.is_empty() { 0 } else { Self::RX_READY }
+    }
+
+    fn snapshot(&self) -> [u32; 4] {
+        [
+            self.status(),
+            u32::from(self.rx_fifo.front().copied().unwrap_or(0)),
+            u32::from(self.last_tx),
+            self.auxiliary,
+        ]
+    }
+
+    fn read(&mut self, address: u32, size: usize) -> u64 {
+        let offset = address.wrapping_sub(DSP_CONTROL_BASE as u32);
+        let aligned = offset & !3;
+        let raw = match aligned {
+            0 => self.status(),
+            4 => u32::from(self.rx_fifo.pop_front().unwrap_or(0)),
+            8 => u32::from(self.last_tx),
+            12 => self.auxiliary,
+            _ => 0,
+        };
+        let shift = (offset & 3) * 8;
+        u64::from((raw >> shift) & width_mask(size))
+    }
+
+    fn write(&mut self, address: u32, size: usize, value: u64) {
+        let offset = address.wrapping_sub(DSP_CONTROL_BASE as u32);
+        let aligned = offset & !3;
+        if aligned == 8 {
+            self.last_tx = value as u16;
+            self.transmit(self.last_tx);
+            return;
+        }
+
+        let shift = (offset & 3) * 8;
+        let value_mask = width_mask(size);
+        let mask = value_mask.wrapping_shl(shift);
+        let update = |register: &mut u32| {
+            *register = (*register & !mask) | (((value as u32).wrapping_shl(shift)) & mask);
+        };
+        match aligned {
+            0 => update(&mut self.control),
+            12 => update(&mut self.auxiliary),
+            _ => {}
+        }
+    }
+
+    fn transmit(&mut self, word: u16) {
+        match self.parser {
+            DspBootParser::Command => match word {
+                0x000b => self.rx_fifo.push_back(0x0305),
+                0x0001 | 0x0002 | 0x0005 | 0x0006 | 0x0003 => {
+                    self.parser = DspBootParser::Arguments {
+                        command: word,
+                        address: None,
+                    };
+                }
+                // Runtime DSP commands are intentionally left for the runtime
+                // mailbox model. TX remains ready, but boot ROM behavior is not
+                // invented for commands not established by the loader.
+                _ => {}
+            },
+            DspBootParser::Arguments { command: 0x0003, .. } => {
+                // Start execution takes one address word and has no boot-ROM
+                // response. DSP execution itself is not implemented here.
+                self.parser = DspBootParser::Running;
+            }
+            DspBootParser::Running => {
+                // Once execution starts, words belong to the runtime mailbox
+                // protocol and must not be reinterpreted as boot-ROM commands.
+            }
+            DspBootParser::Arguments { command, address: None } => {
+                self.parser = DspBootParser::Arguments {
+                    command,
+                    address: Some(word),
+                };
+            }
+            DspBootParser::Arguments {
+                command,
+                address: Some(address),
+            } => {
+                let memory_space = match command {
+                    0x0001 | 0x0005 => 0,
+                    0x0002 | 0x0006 => 1,
+                    _ => {
+                        self.parser = DspBootParser::Command;
+                        return;
+                    }
+                };
+                if matches!(command, 0x0001 | 0x0002) {
+                    self.parser = if word == 0 {
+                        DspBootParser::Command
+                    } else {
+                        DspBootParser::Upload {
+                            memory_space,
+                            address,
+                            remaining: word,
+                        }
+                    };
+                } else {
+                    for index in 0..word {
+                        let location = address.wrapping_add(index);
+                        self.rx_fifo.push_back(
+                            self.memories[memory_space as usize]
+                                .get(&location)
+                                .copied()
+                                .unwrap_or(0),
+                        );
+                    }
+                    self.parser = DspBootParser::Command;
+                }
+            }
+            DspBootParser::Upload {
+                memory_space,
+                address,
+                remaining,
+            } => {
+                self.memories[memory_space as usize].insert(address, word);
+                self.parser = if remaining == 1 {
+                    DspBootParser::Command
+                } else {
+                    DspBootParser::Upload {
+                        memory_space,
+                        address: address.wrapping_add(1),
+                        remaining: remaining - 1,
+                    }
+                };
+            }
+        }
+    }
+}
+
 struct E830State {
     registers: HashMap<u32, u32>,
+    dsp_boot: DspBootInterface,
     nor: crate::nor::NorFlash,
     lcd_bus_mode: u16,
     lcd_register_index: u16,
@@ -191,7 +426,9 @@ struct E830State {
     lcd_frames: u64,
     keyboard_init_entries: u64,
     standby_look_entries: u64,
-    timer: u32,
+    timer_counter: u16,
+    timer_last_update: u64,
+    system_timer_irq_pending: bool,
     instructions: u64,
     fast_forwarded_instructions: u64,
     instruction_budget: u64,
@@ -226,13 +463,47 @@ struct E830State {
     pc_log_remaining: u64,
     // Optional read-only register trace at selected instruction addresses.
     watch_pcs: HashSet<u64>,
+    watch_after: u64,
     watch_remaining: u64,
+    trace_sp_below: Option<u32>,
+    trace_sp_after: u64,
+    trace_sp_remaining: u64,
+    trace_sp_last: Option<u32>,
+    trace_sp_last_pc: u64,
     // Diagnostic: when set (E830_TRACE_IRQEN), log the first PC at
     // which the CPSR IRQ mask (I) and FIQ mask (F) are observed cleared. This
     // pins down whether and where early boot ever unmasks interrupts.
     trace_irqen: bool,
     irqen_logged_i: bool,
     irqen_logged_f: bool,
+    // Read-only focused trace for the post-mount power/wakeup investigation.
+    // E830_TRACE_WAKE enables it; E830_TRACE_WAKE_LIMIT bounds stderr output.
+    trace_wake: bool,
+    trace_wake_after: u64,
+    trace_wake_remaining: u64,
+    // Read-only focused trace for the system timer/IRQ20 investigation.
+    // Unlike the broader wake trace, counter reads are omitted so early boot
+    // polling cannot consume the output budget before timer initialization.
+    trace_timer: bool,
+    trace_timer_after: u64,
+    trace_timer_remaining: u64,
+    // Read-only trace for the RTOS globals involved in the late object lookup.
+    // This records the firmware instruction responsible for every write; it
+    // does not initialize or otherwise alter guest state.
+    trace_rtos_globals: bool,
+    trace_rtos_globals_after: u64,
+    trace_rtos_globals_remaining: u64,
+    // Read-only focused trace for the critical-section nesting byte. Kept
+    // separate from the broader RTOS-globals budget because this byte changes
+    // frequently during normal scheduling.
+    trace_nesting: bool,
+    trace_nesting_after: u64,
+    trace_nesting_remaining: u64,
+    // Read-only trace for the ARM/DSP control and shared mailbox handshake.
+    trace_dsp: bool,
+    trace_dsp_after: u64,
+    trace_dsp_remaining: u64,
+    trace_dsp_last: Option<(u64, [u32; 8])>,
 }
 
 impl E830State {
@@ -248,6 +519,7 @@ impl E830State {
         registers.insert(SOC_BOOT_READY_INPUT_REGISTER, SOC_BOOT_READY_INPUT_MASK);
         Self {
             registers,
+            dsp_boot: Default::default(),
             nor: crate::nor::NorFlash::new(flash),
             lcd_bus_mode: 0,
             lcd_register_index: 0,
@@ -256,7 +528,9 @@ impl E830State {
             lcd_frames: 0,
             keyboard_init_entries: 0,
             standby_look_entries: 0,
-            timer: 0,
+            timer_counter: 0,
+            timer_last_update: 0,
+            system_timer_irq_pending: false,
             instructions: 0,
             fast_forwarded_instructions: 0,
             instruction_budget: u64::MAX,
@@ -291,11 +565,57 @@ impl E830State {
                     raw.strip_prefix("0x").map(|hex| u64::from_str_radix(hex, 16))
                         .unwrap_or_else(|| raw.parse()).ok().map(|pc| pc & !1)
                 }).collect(),
+            watch_after: env_u64("E830_WATCH_AFTER").unwrap_or(0),
             watch_remaining: env_u64("E830_WATCH_LIMIT").unwrap_or(1000),
+            trace_sp_below: env_u64("E830_TRACE_SP_BELOW").map(|value| value as u32),
+            trace_sp_after: env_u64("E830_TRACE_SP_AFTER").unwrap_or(0),
+            trace_sp_remaining: env_u64("E830_TRACE_SP_LIMIT").unwrap_or(1000),
+            trace_sp_last: None,
+            trace_sp_last_pc: 0,
             trace_irqen: std::env::var("E830_TRACE_IRQEN").is_ok(),
             irqen_logged_i: false,
             irqen_logged_f: false,
+            trace_wake: std::env::var("E830_TRACE_WAKE").is_ok(),
+            trace_wake_after: env_u64("E830_TRACE_WAKE_AFTER").unwrap_or(0),
+            trace_wake_remaining: env_u64("E830_TRACE_WAKE_LIMIT").unwrap_or(4000),
+            trace_timer: std::env::var("E830_TRACE_TIMER").is_ok(),
+            trace_timer_after: env_u64("E830_TRACE_TIMER_AFTER").unwrap_or(0),
+            trace_timer_remaining: env_u64("E830_TRACE_TIMER_LIMIT").unwrap_or(4000),
+            trace_rtos_globals: std::env::var("E830_TRACE_RTOS_GLOBALS").is_ok(),
+            trace_rtos_globals_after: env_u64("E830_TRACE_RTOS_GLOBALS_AFTER").unwrap_or(0),
+            trace_rtos_globals_remaining: env_u64("E830_TRACE_RTOS_GLOBALS_LIMIT").unwrap_or(1000),
+            trace_nesting: std::env::var("E830_TRACE_NESTING").is_ok(),
+            trace_nesting_after: env_u64("E830_TRACE_NESTING_AFTER").unwrap_or(0),
+            trace_nesting_remaining: env_u64("E830_TRACE_NESTING_LIMIT").unwrap_or(1000),
+            trace_dsp: std::env::var("E830_TRACE_DSP").is_ok(),
+            trace_dsp_after: env_u64("E830_TRACE_DSP_AFTER").unwrap_or(0),
+            trace_dsp_remaining: env_u64("E830_TRACE_DSP_LIMIT").unwrap_or(1000),
+            trace_dsp_last: None,
         }
+    }
+
+    fn trace_wake_line(&mut self, line: String) {
+        let total = self.instructions.saturating_add(self.fast_forwarded_instructions);
+        if !self.trace_wake
+            || total < self.trace_wake_after
+            || self.trace_wake_remaining == 0
+        {
+            return;
+        }
+        self.trace_wake_remaining -= 1;
+        eprintln!("[e830-wake] {line}");
+    }
+
+    fn trace_timer_line(&mut self, line: String) {
+        let total = self.instructions.saturating_add(self.fast_forwarded_instructions);
+        if !self.trace_timer
+            || total < self.trace_timer_after
+            || self.trace_timer_remaining == 0
+        {
+            return;
+        }
+        self.trace_timer_remaining -= 1;
+        eprintln!("[e830-timer] {line}");
     }
 
     fn record_mmio(&mut self, access: MmioAccess) {
@@ -309,14 +629,67 @@ impl E830State {
                 access.address, access.size, access.value, access.pc
             );
         }
+        if (WAKE_MMIO_START..=WAKE_MMIO_END).contains(&access.address)
+            || (INTC_PENDING_NUMBER_REGISTER..=INTC_PENDING_MASK_REGISTER)
+                .contains(&access.address)
+        {
+            let action = if access.write { "write" } else { "read" };
+            let total = self.instructions.saturating_add(self.fast_forwarded_instructions);
+            self.trace_wake_line(format!(
+                "mmio {action} addr=0x{:08x} size={} value=0x{:08x} pc=0x{:08x} insns={total}",
+                access.address, access.size, access.value, access.pc
+            ));
+        }
+        if access.write
+            && ((SOC_TIMER..=SOC_TIMER + 0x14).contains(&access.address)
+                || access.address == INTC_ENABLE_MASK_REGISTER)
+        {
+            let action = if access.write { "write" } else { "read" };
+            let total = self.instructions.saturating_add(self.fast_forwarded_instructions);
+            let timer_line_masked = self
+                .registers
+                .get(&INTC_ENABLE_MASK_REGISTER)
+                .copied()
+                .unwrap_or(u32::MAX)
+                & (1 << 20)
+                != 0;
+            self.trace_timer_line(format!(
+                "mmio {action} addr=0x{:08x} size={} value=0x{:08x} pc=0x{:08x} irq20_masked={timer_line_masked} insns={total}",
+                access.address, access.size, access.value, access.pc
+            ));
+        }
         self.recent_mmio.push_back(access);
     }
 
     // Device interrupt levels persist until their own status is cleared.
     fn pending_lines(&self) -> u32 {
         let diagnostic = if self.timer_irq_pending { 1 << (self.timer_irq_index & 31) } else { 0 };
+        let system_timer = if self.system_timer_irq_pending { 1 << SYSTEM_TIMER_IRQ } else { 0 };
         let i2c = if self.i2c.irq_pending() { 1 << I2C_IRQ } else { 0 };
-        diagnostic | i2c
+        diagnostic | system_timer | i2c
+    }
+
+    fn advance_system_timer(&mut self, now: u64) {
+        let elapsed = now.saturating_sub(self.timer_last_update);
+        self.timer_last_update = now;
+        if elapsed == 0 {
+            return;
+        }
+
+        let wraps = elapsed > u64::from(u16::MAX - self.timer_counter);
+        self.timer_counter = self.timer_counter.wrapping_add(elapsed as u16);
+        let control = self.registers.get(&(SOC_TIMER + 8)).copied().unwrap_or(0);
+        if wraps && control & 0x40 != 0 {
+            // The firmware programs the next timer period at +0x14.  With the
+            // reload bit set, hardware publishes it as the active period at
+            // +0x0c on rollover; delay bookkeeping relies on that transition.
+            let reload = self.registers.get(&(SOC_TIMER + 0x14)).copied().unwrap_or(0);
+            self.registers.insert(SOC_TIMER + 0x0c, reload & 0xffff);
+        }
+        if wraps && control & 0x20 != 0 {
+            *self.registers.entry(SOC_TIMER + 8).or_default() |= 0x80;
+            self.system_timer_irq_pending = true;
+        }
     }
 
     fn enabled_pending_lines(&self) -> u32 {
@@ -329,6 +702,11 @@ impl E830State {
     }
 
     fn read_register(&mut self, address: u32, size: usize, pc: u32) -> u64 {
+        if u64::from(address) >= DSP_CONTROL_BASE
+            && u64::from(address) < DSP_CONTROL_BASE + DSP_BOOT_MMIO_SIZE
+        {
+            return self.dsp_boot.read(address, size);
+        }
         if u64::from(address) >= ONENAND_BASE && u64::from(address) < ONENAND_BASE + ONENAND_SIZE {
             return self.onenand.read(address - ONENAND_BASE as u32, size);
         }
@@ -343,9 +721,7 @@ impl E830State {
         {
             u32::MAX
         } else if address == SOC_TIMER {
-            let value = self.timer;
-            self.timer = self.timer.wrapping_add(4);
-            value
+            u32::from(self.timer_counter)
         } else if aligned == INTC_PENDING_NUMBER_REGISTER {
             // The IRQ vector handler reads this byte and uses it directly as the
             // pre-multiplied dispatch index, stable while a handler runs.
@@ -371,6 +747,12 @@ impl E830State {
     }
 
     fn write_register(&mut self, address: u32, size: usize, value: u64) {
+        if u64::from(address) >= DSP_CONTROL_BASE
+            && u64::from(address) < DSP_CONTROL_BASE + DSP_BOOT_MMIO_SIZE
+        {
+            self.dsp_boot.write(address, size, value);
+            return;
+        }
         if u64::from(address) >= ONENAND_BASE && u64::from(address) < ONENAND_BASE + ONENAND_SIZE {
             self.onenand.write(address - ONENAND_BASE as u32, size, value);
             return;
@@ -394,6 +776,11 @@ impl E830State {
             *register = (*register & !mask) | (((value as u32).wrapping_shl(shift)) & mask);
             *register
         };
+        if aligned == SOC_TIMER + 8 && updated & 0x80 == 0 {
+            // IRQ20 is a peripheral level. The firmware's handler clears the
+            // timer's 0x80 status bit before the interrupt controller EOI.
+            self.system_timer_irq_pending = false;
+        }
         if aligned == SOC_INIT_CONTROL_REGISTER && updated & 0x80 != 0 {
             *self.registers.entry(SOC_INIT_STATUS_REGISTER).or_default() |= 0x07;
             // The IRQ vector handler writes 0x80 here as its end-of-interrupt
@@ -503,7 +890,9 @@ impl E830Machine {
 
         map_memory(cpu, DSP_SHARED_RAM_BASE, DSP_SHARED_RAM_SIZE,
             Prot::READ | Prot::WRITE, "mapping shared DSP data")?;
-        map_memory(cpu, DSP_AUX_RAM_BASE, DSP_AUX_RAM_SIZE,
+        map_mmio(cpu, DSP_CONTROL_BASE, DSP_BOOT_MMIO_SIZE)?;
+        map_memory(cpu, DSP_AUX_RAM_BASE + DSP_BOOT_MMIO_SIZE,
+            DSP_AUX_RAM_SIZE - DSP_BOOT_MMIO_SIZE,
             Prot::READ | Prot::WRITE, "mapping auxiliary DSP data")?;
         map_memory(
             cpu,
@@ -1117,8 +1506,31 @@ fn install_hooks(cpu: &mut Unicorn<'static, E830State>) -> Result<(), MachineErr
             return;
         }
 
-        if uc.get_data().watch_remaining > 0 && uc.get_data().watch_pcs.contains(&address) {
-            let total = uc.get_data().instructions.saturating_add(uc.get_data().fast_forwarded_instructions);
+        let total = uc.get_data().instructions.saturating_add(uc.get_data().fast_forwarded_instructions);
+        if let Some(limit) = uc.get_data().trace_sp_below {
+            let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+            let (last_sp, last_pc, after, remaining) = {
+                let state = uc.get_data();
+                (state.trace_sp_last, state.trace_sp_last_pc, state.trace_sp_after,
+                    state.trace_sp_remaining)
+            };
+            if total >= after && remaining > 0 && sp < limit && last_sp != Some(sp) {
+                let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+                let cpsr = uc.reg_read(RegisterARM::CPSR).unwrap_or(0) as u32;
+                eprintln!(
+                    "[e830-sp] pc=0x{address:08x} prev_pc=0x{last_pc:08x} sp=0x{sp:08x} prev_sp=0x{:08x} lr=0x{lr:08x} cpsr=0x{cpsr:08x} insns={total}",
+                    last_sp.unwrap_or(0)
+                );
+                uc.get_data_mut().trace_sp_remaining -= 1;
+            }
+            let state = uc.get_data_mut();
+            state.trace_sp_last = Some(sp);
+            state.trace_sp_last_pc = address;
+        }
+        if total >= uc.get_data().watch_after
+            && uc.get_data().watch_remaining > 0
+            && uc.get_data().watch_pcs.contains(&address)
+        {
             let registers = [RegisterARM::R0, RegisterARM::R1, RegisterARM::R2, RegisterARM::R3,
                 RegisterARM::R4, RegisterARM::R5, RegisterARM::R6, RegisterARM::R7,
                 RegisterARM::SP, RegisterARM::LR, RegisterARM::CPSR];
@@ -1126,6 +1538,86 @@ fn install_hooks(cpu: &mut Unicorn<'static, E830State>) -> Result<(), MachineErr
                 format!("{:?}=0x{:08x}", register, uc.reg_read(register).unwrap_or(0))).collect();
             eprintln!("[e830-watch] pc=0x{address:08x} insns={total} {}", values.join(" "));
             uc.get_data_mut().watch_remaining -= 1;
+        }
+        if DSP_TRACE_PCS.contains(&address) {
+            let should_log = {
+                let state = uc.get_data();
+                state.trace_dsp
+                    && total >= state.trace_dsp_after
+                    && state.trace_dsp_remaining > 0
+            };
+            if should_log {
+                let mailbox = uc.mem_read_as_vec(DSP_MAILBOX_BASE, 64).unwrap_or_default();
+                let word = |bytes: &[u8], offset: usize| -> u32 {
+                    bytes.get(offset..offset + 4)
+                        .and_then(|slice| slice.try_into().ok())
+                        .map(u32::from_le_bytes)
+                        .unwrap_or(0)
+                };
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+                let r6 = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
+                let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+                let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+                let control = uc.get_data().dsp_boot.snapshot();
+                let values = [
+                    control[0], control[1], control[2], control[3],
+                    word(&mailbox, 0), word(&mailbox, 0x10), word(&mailbox, 0x14),
+                    word(&mailbox, 0x18),
+                ];
+                let changed = uc.get_data().trace_dsp_last
+                    .map(|(last_pc, last_values)| last_pc != address || last_values != values)
+                    .unwrap_or(true);
+                if changed {
+                    eprintln!(
+                        "[e830-dsp] pc=0x{address:08x} ctl0=0x{:08x} ctl4=0x{:08x} ctl8=0x{:08x} ctlc=0x{:08x} mbx640=0x{:08x} mbx650=0x{:08x} mbx654=0x{:08x} mbx658=0x{:08x} r0=0x{r0:08x} r1=0x{r1:08x} r4=0x{r4:08x} r6=0x{r6:08x} sp=0x{sp:08x} lr=0x{lr:08x} insns={total}",
+                        values[0], values[1], values[2], values[3], values[4], values[5],
+                        values[6], values[7]
+                    );
+                    let state = uc.get_data_mut();
+                    state.trace_dsp_last = Some((address, values));
+                    state.trace_dsp_remaining -= 1;
+                }
+            }
+        }
+
+        let wake_pc = (WAKE_WAIT_TRACE_START..=WAKE_WAIT_TRACE_END).contains(&address)
+            || WAKE_IRQ_TRACE_PCS.contains(&address);
+        if wake_pc && uc.get_data().trace_wake {
+            let total = uc.get_data().instructions.saturating_add(uc.get_data().fast_forwarded_instructions);
+            let after = uc.get_data().trace_wake_after;
+            if total >= after && uc.get_data().trace_wake_remaining > 0 {
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+                let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+                let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+                let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+                let cpsr = uc.reg_read(RegisterARM::CPSR).unwrap_or(0) as u32;
+                uc.get_data_mut().trace_wake_line(format!(
+                    "pc=0x{address:08x} r0=0x{r0:08x} r1=0x{r1:08x} r4=0x{r4:08x} r5=0x{r5:08x} sp=0x{sp:08x} lr=0x{lr:08x} cpsr=0x{cpsr:08x} insns={total}"
+                ));
+            }
+        }
+
+        if TIMER_TRACE_PCS.contains(&address) && uc.get_data().trace_timer {
+            let total = uc.get_data().instructions.saturating_add(uc.get_data().fast_forwarded_instructions);
+            let after = uc.get_data().trace_timer_after;
+            if total >= after && uc.get_data().trace_timer_remaining > 0 {
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+                let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+                let cpsr = uc.reg_read(RegisterARM::CPSR).unwrap_or(0) as u32;
+                let state = uc.get_data();
+                let mask = state.registers.get(&INTC_ENABLE_MASK_REGISTER).copied().unwrap_or(u32::MAX);
+                let control = state.registers.get(&(SOC_TIMER + 8)).copied().unwrap_or(0);
+                let compare = state.registers.get(&(SOC_TIMER + 0x0c)).copied().unwrap_or(0);
+                uc.get_data_mut().trace_timer_line(format!(
+                    "pc=0x{address:08x} r0=0x{r0:08x} r1=0x{r1:08x} sp=0x{sp:08x} lr=0x{lr:08x} cpsr=0x{cpsr:08x} mask=0x{mask:08x} ctrl=0x{control:08x} cmp0=0x{compare:08x} insns={total}"
+                ));
+            }
         }
 
         // Diagnostic: pin down whether/where early boot unmasks interrupts.
@@ -1167,6 +1659,7 @@ fn install_hooks(cpu: &mut Unicorn<'static, E830State>) -> Result<(), MachineErr
             let state = uc.get_data_mut();
             let total = state.instructions.saturating_add(state.fast_forwarded_instructions);
             state.i2c.advance(total);
+            state.advance_system_timer(total);
             if state.timer_irq_period == 0 {
                 state.enabled_pending_lines() != 0
             } else {
@@ -1344,6 +1837,129 @@ fn install_hooks(cpu: &mut Unicorn<'static, E830State>) -> Result<(), MachineErr
     .map_err(|error| unicorn_error("installing the instruction counter", error))?;
 
     cpu.add_mem_hook(
+        HookType::MEM_WRITE,
+        WAKE_STATE_START,
+        WAKE_STATE_END,
+        |uc, _, address, size, value| {
+            let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+            let total = uc.get_data().instructions.saturating_add(uc.get_data().fast_forwarded_instructions);
+            uc.get_data_mut().trace_wake_line(format!(
+                "ram write addr=0x{address:08x} size={size} value=0x{value:08x} pc=0x{pc:08x} insns={total}"
+            ));
+            false
+        },
+    )
+    .map_err(|error| unicorn_error("installing the wake-state trace", error))?;
+
+    cpu.add_mem_hook(
+        HookType::MEM_WRITE,
+        WAKE_STUB_START,
+        WAKE_STUB_END,
+        |uc, _, address, size, value| {
+            let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+            let total = uc.get_data().instructions.saturating_add(uc.get_data().fast_forwarded_instructions);
+            uc.get_data_mut().trace_wake_line(format!(
+                "stub write addr=0x{address:08x} size={size} value=0x{value:08x} pc=0x{pc:08x} insns={total}"
+            ));
+            false
+        },
+    )
+    .map_err(|error| unicorn_error("installing the wake-stub trace", error))?;
+
+    cpu.add_mem_hook(
+        HookType::MEM_WRITE,
+        SYSTEM_TIMER_BOOKKEEPING_START,
+        SYSTEM_TIMER_BOOKKEEPING_END,
+        |uc, _, address, size, value| {
+            let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+            let total = uc.get_data().instructions.saturating_add(uc.get_data().fast_forwarded_instructions);
+            let state = uc.get_data();
+            let counter = state.timer_counter;
+            let control = state.registers.get(&(SOC_TIMER + 8)).copied().unwrap_or(0);
+            let period = state.registers.get(&(SOC_TIMER + 0x0c)).copied().unwrap_or(0);
+            let match0 = state.registers.get(&(SOC_TIMER + 0x10)).copied().unwrap_or(0);
+            let match1 = state.registers.get(&(SOC_TIMER + 0x14)).copied().unwrap_or(0);
+            uc.get_data_mut().trace_timer_line(format!(
+                "ram write addr=0x{address:08x} size={size} value=0x{value:08x} pc=0x{pc:08x} counter=0x{counter:04x} ctrl=0x{control:08x} period=0x{period:08x} match0=0x{match0:08x} match1=0x{match1:08x} insns={total}"
+            ));
+            false
+        },
+    )
+    .map_err(|error| unicorn_error("installing the system-timer bookkeeping trace", error))?;
+
+    cpu.add_mem_hook(
+        HookType::MEM_WRITE,
+        RTOS_GLOBALS_TRACE_START,
+        RTOS_GLOBALS_TRACE_END,
+        |uc, _, address, size, value| {
+            let total = uc.get_data().instructions
+                .saturating_add(uc.get_data().fast_forwarded_instructions);
+            let write_end = address.saturating_add(size as u64).saturating_sub(1);
+            let hits_target = RTOS_GLOBALS_TRACE_TARGETS.iter().any(|&(start, end)| {
+                address <= end && write_end >= start
+            });
+            let should_log = {
+                let state = uc.get_data();
+                hits_target
+                    && state.trace_rtos_globals
+                    && total >= state.trace_rtos_globals_after
+                    && state.trace_rtos_globals_remaining > 0
+            };
+            if should_log {
+                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                eprintln!(
+                    "[e830-rtos] write addr=0x{address:08x} size={size} value=0x{value:08x} pc=0x{pc:08x} insns={total}"
+                );
+                uc.get_data_mut().trace_rtos_globals_remaining -= 1;
+            }
+            false
+        },
+    )
+    .map_err(|error| unicorn_error("installing the RTOS-globals trace", error))?;
+
+    cpu.add_mem_hook(
+        HookType::MEM_WRITE,
+        RTOS_NESTING_DEPTH & !3,
+        (RTOS_NESTING_DEPTH & !3) + 3,
+        |uc, _, address, size, value| {
+            let total = uc.get_data().instructions
+                .saturating_add(uc.get_data().fast_forwarded_instructions);
+            let write_end = address.saturating_add(size as u64).saturating_sub(1);
+            let hits_nesting = address <= RTOS_NESTING_DEPTH
+                && write_end >= RTOS_NESTING_DEPTH;
+            let should_log = {
+                let state = uc.get_data();
+                hits_nesting
+                    && state.trace_nesting
+                    && total >= state.trace_nesting_after
+                    && state.trace_nesting_remaining > 0
+            };
+            if should_log {
+                let old = uc.mem_read_as_vec(RTOS_NESTING_DEPTH, 1)
+                    .ok()
+                    .and_then(|bytes| bytes.first().copied())
+                    .unwrap_or(0);
+                let byte_offset = RTOS_NESTING_DEPTH.saturating_sub(address) as usize;
+                let new = if byte_offset < size {
+                    ((value >> (byte_offset * 8)) & 0xff) as u8
+                } else {
+                    old
+                };
+                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+                let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+                let cpsr = uc.reg_read(RegisterARM::CPSR).unwrap_or(0) as u32;
+                eprintln!(
+                    "[e830-nesting] old=0x{old:02x} new=0x{new:02x} addr=0x{address:08x} size={size} value=0x{value:08x} pc=0x{pc:08x} sp=0x{sp:08x} lr=0x{lr:08x} cpsr=0x{cpsr:08x} insns={total}"
+                );
+                uc.get_data_mut().trace_nesting_remaining -= 1;
+            }
+            false
+        },
+    )
+    .map_err(|error| unicorn_error("installing the RTOS-nesting trace", error))?;
+
+    cpu.add_mem_hook(
         HookType::MEM_INVALID,
         0,
         u64::MAX,
@@ -1393,12 +2009,87 @@ fn unicorn_error(operation: &'static str, error: impl std::fmt::Debug) -> Machin
 mod tests {
     use super::{
         fast_forward_counting_delay, fast_forward_nested_delay, find_counting_delay_loop_pcs,
-        find_fade_delay_loop_pcs, find_nested_delay_loop_pcs, E830Machine, E830State,
+        find_fade_delay_loop_pcs, find_nested_delay_loop_pcs, DspBootInterface, E830Machine, E830State,
         COUNTING_DELAY_LOOP, FADE_DELAY_LOOP,
         E830_TFS_SOURCE_BASE, FLASH_BASE,
         NESTED_DELAY_LOOP, SOC_BOOT_READY_INPUT_MASK, SOC_BOOT_READY_INPUT_REGISTER,
-        SOC_KEYPAD_INPUT_REGISTERS, SOC_KEYPAD_SCAN_READ_PCS,
+        SOC_INIT_CONTROL_REGISTER, SOC_KEYPAD_INPUT_REGISTERS, SOC_KEYPAD_SCAN_READ_PCS, SOC_TIMER,
+        SYSTEM_TIMER_IRQ,
     };
+
+    #[test]
+    fn dsp_boot_signature_sets_and_clears_rx_ready() {
+        let mut dsp = DspBootInterface::default();
+        assert_eq!(dsp.status() & 3, DspBootInterface::TX_READY);
+
+        dsp.write(super::DSP_CONTROL_BASE as u32 + 8, 4, 0x000b);
+        assert_eq!(dsp.status() & 3, DspBootInterface::TX_READY | DspBootInterface::RX_READY);
+        assert_eq!(dsp.read(super::DSP_CONTROL_BASE as u32 + 4, 4), 0x0305);
+        assert_eq!(dsp.status() & 3, DspBootInterface::TX_READY);
+    }
+
+    #[test]
+    fn dsp_boot_fifo_preserves_upload_for_readback() {
+        let mut dsp = DspBootInterface::default();
+        for word in [0x0001u16, 0x0020, 0x0003, 0x1111, 0x2222, 0x3333] {
+            dsp.write(super::DSP_CONTROL_BASE as u32 + 8, 4, u64::from(word));
+        }
+        for word in [0x0005u16, 0x0020, 0x0003] {
+            dsp.write(super::DSP_CONTROL_BASE as u32 + 8, 4, u64::from(word));
+        }
+
+        assert_eq!(dsp.read(super::DSP_CONTROL_BASE as u32 + 4, 2), 0x1111);
+        assert_ne!(dsp.status() & DspBootInterface::RX_READY, 0);
+        assert_eq!(dsp.read(super::DSP_CONTROL_BASE as u32 + 4, 2), 0x2222);
+        assert_eq!(dsp.read(super::DSP_CONTROL_BASE as u32 + 4, 2), 0x3333);
+        assert_eq!(dsp.status() & DspBootInterface::RX_READY, 0);
+    }
+
+    #[test]
+    fn dsp_boot_memory_spaces_are_independent() {
+        let mut dsp = DspBootInterface::default();
+        for word in [0x0001, 0x7000, 0x0001, 0xaaaa] {
+            dsp.transmit(word);
+        }
+        for word in [0x0002, 0x7000, 0x0001, 0xbbbb] {
+            dsp.transmit(word);
+        }
+        for word in [0x0005, 0x7000, 0x0001] {
+            dsp.transmit(word);
+        }
+        for word in [0x0006, 0x7000, 0x0001] {
+            dsp.transmit(word);
+        }
+
+        assert_eq!(dsp.read(super::DSP_CONTROL_BASE as u32 + 4, 2), 0xaaaa);
+        assert_eq!(dsp.read(super::DSP_CONTROL_BASE as u32 + 4, 2), 0xbbbb);
+    }
+
+    #[test]
+    fn dsp_control_keeps_firmware_bits_while_status_is_device_owned() {
+        let mut dsp = DspBootInterface::default();
+        dsp.write(super::DSP_CONTROL_BASE as u32, 4, 0x0048);
+        assert_eq!(dsp.read(super::DSP_CONTROL_BASE as u32, 4), 0x0049);
+        dsp.transmit(0x000b);
+        assert_eq!(dsp.read(super::DSP_CONTROL_BASE as u32, 4), 0x004b);
+    }
+
+    #[test]
+    fn dsp_start_leaves_boot_protocol_before_runtime_commands() {
+        let mut dsp = DspBootInterface::default();
+        for word in [0x0001, 0x0020, 0x0001, 0xabcd, 0x0003, 0x0000] {
+            dsp.transmit(word);
+        }
+
+        // A runtime command that shares the boot readback opcode must not
+        // consume later words as an address/count tuple or produce boot data.
+        for word in [0x0006, 0x0020, 0x0001] {
+            dsp.transmit(word);
+        }
+
+        assert_eq!(dsp.status() & DspBootInterface::RX_READY, 0);
+        assert_eq!(dsp.read(super::DSP_CONTROL_BASE as u32 + 4, 2), 0);
+    }
 
     #[test]
     fn short_valid_vector_image_is_rejected_before_boot_alias_slicing() {
@@ -1445,6 +2136,86 @@ mod tests {
             u64::from(u32::MAX)
         );
         assert_eq!(state.read_register(register, 4, 0), 0x0055_4027);
+    }
+
+    #[test]
+    fn system_timer_advances_independently_of_counter_reads() {
+        let mut state = E830State::new(
+            false,
+            vec![0xff; 0x1000],
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        );
+        state.advance_system_timer(123);
+        assert_eq!(state.read_register(SOC_TIMER, 2, 0), 123);
+        assert_eq!(state.read_register(SOC_TIMER, 2, 0), 123);
+        state.advance_system_timer(130);
+        assert_eq!(state.read_register(SOC_TIMER, 2, 0), 130);
+    }
+
+    #[test]
+    fn enabled_system_timer_wrap_sets_status_and_irq20() {
+        let mut state = E830State::new(
+            false,
+            vec![0xff; 0x1000],
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        );
+        state.write_register(SOC_TIMER + 8, 2, 0x20);
+        state.timer_counter = 0xfffe;
+        state.advance_system_timer(2);
+        assert_eq!(state.read_register(SOC_TIMER, 2, 0), 0);
+        assert_ne!(state.read_register(SOC_TIMER + 8, 2, 0) & 0x80, 0);
+        assert_ne!(state.pending_lines() & (1 << SYSTEM_TIMER_IRQ), 0);
+    }
+
+    #[test]
+    fn system_timer_wrap_latches_programmed_period() {
+        let mut state = E830State::new(
+            false,
+            vec![0xff; 0x1000],
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        );
+        state.write_register(SOC_TIMER + 8, 2, 0x40);
+        state.write_register(SOC_TIMER + 0x0c, 2, 5000);
+        state.write_register(SOC_TIMER + 0x14, 2, 4700);
+        state.timer_counter = 0xfffe;
+
+        state.advance_system_timer(1);
+        assert_eq!(state.read_register(SOC_TIMER + 0x0c, 2, 0), 5000);
+        state.advance_system_timer(2);
+        assert_eq!(state.read_register(SOC_TIMER + 0x0c, 2, 0), 4700);
+    }
+
+    #[test]
+    fn system_timer_irq_persists_until_peripheral_status_is_cleared() {
+        let mut state = E830State::new(
+            false,
+            vec![0xff; 0x1000],
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        );
+        state.write_register(SOC_TIMER + 8, 2, 0x20);
+        state.timer_counter = 0xffff;
+        state.advance_system_timer(1);
+        state.active_irq_line = SYSTEM_TIMER_IRQ;
+        state.timer_irq_in_service = true;
+
+        state.write_register(SOC_INIT_CONTROL_REGISTER, 1, 0x80);
+        assert_ne!(state.pending_lines() & (1 << SYSTEM_TIMER_IRQ), 0);
+
+        state.write_register(SOC_TIMER + 8, 2, 0x120);
+        assert_eq!(state.pending_lines() & (1 << SYSTEM_TIMER_IRQ), 0);
+        assert_eq!(state.read_register(SOC_TIMER + 8, 2, 0) & 0x80, 0);
     }
 
     #[test]
@@ -1658,7 +2429,10 @@ mod tests {
         let mut machine = E830Machine::new(firmware, false).unwrap();
         assert_eq!(machine.peek_u32(0x21c20000).unwrap(), 0x78563412);
         assert_eq!(machine.peek_u32(0x21f40000).unwrap(), u32::MAX);
-        assert_eq!(machine.peek_u32(super::DSP_AUX_RAM_BASE as u32).unwrap(), 0);
+        assert_eq!(
+            machine.peek_u32(super::DSP_AUX_RAM_BASE as u32).unwrap(),
+            DspBootInterface::TX_READY
+        );
         let cpu = machine.cpu.raw_engine();
         let mut readback = vec![0; package.len()];
         cpu.mem_read(E830_TFS_SOURCE_BASE, &mut readback).unwrap();

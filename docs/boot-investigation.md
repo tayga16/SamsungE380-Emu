@@ -1,6 +1,6 @@
 ﻿# E830: current native Windows boot investigation
 
-Updated 2026-10-25. This file describes the standalone Rust/Unicorn model.
+Updated 2026-10-27. This file describes the standalone Rust/Unicorn model.
 The old QEMU, forced-IRQ and clock-acceleration notes are archived in
 [boot-investigation-legacy.md](boot-investigation-legacy.md); they contain
 superseded conclusions and must not guide the current board implementation.
@@ -12,8 +12,43 @@ The original E830XEGG1 firmware draws its SGH-E830/Samsung splash, creates the
 RTOS system stack and unmasks IRQs itself. No main menu is reached. A complete
 TFS image is now installed and verified through a fresh original loader process.
 Retail E830 BML initialization and FAT mounting also succeed on that image.
-Boot remains after the splash; the next investigation is the subsequent power,
-interrupt and scheduler path. Neither mounting nor a splash proves a phone boot.
+With the timer and DSP boot interface modeled, execution reaches the DSP-start
+handshake described below. The splash remains; RD16024 execution is still absent.
+Neither mounting nor a splash proves a phone boot.
+
+### Timer and DSP progress — 2026-10-27
+
+The 16-bit counter at `0x50501000` now advances with guest instruction progress,
+not counter reads. On rollover, control bit `0x20` enables status bit `0x80` and
+IRQ20; peripheral acknowledgement clears the pending level, not INTC EOI alone.
+With control bit `0x40`, rollover copies the programmed period at `+0x14` to
+the active period at `+0x0c`. The original firmware's delay bookkeeping requires
+this transition. This is a provisional instruction-based time model; physical
+clock frequency and complete timer semantics remain unverified.
+
+Local `timer-period-latch` and `long-boot-after-timer` probes observe active and
+next periods of 4700, 1336 interrupts taken, and `TMD_System_Clock=605` in the
+latter probe. These results supersede the earlier zero-clock observation; they
+do not establish correct real-time behavior or a working menu.
+
+The DSP boot interface at `0x60100000` now provides TX/RX FIFO status, the boot
+signature response, uploads and readback in two independent memory spaces.
+The ARM loader uploads `0x6000` halfwords to space 0 at address zero and `0x1000`
+halfwords to space 1 at `0x7000`, then sends command `3` and start address `0`.
+The parser leaves the boot protocol after this pair; later runtime words are
+not interpreted as boot-ROM readback commands. No runtime response is fabricated.
+
+The focused local `bp-dsp-start-signal` probe stops before `0x2098cddc` at
+instruction **141,217,692**, with `memory_fault: None` and the genuine splash.
+The ARM then polls bit 0 of the halfword at `0x50505010`. Its following code
+acknowledges that bit, sends runtime command `0x4001`, and polls `0x50505018`.
+RD16024 execution and the DSP-side signaling operation are not implemented, so
+the signal bit must not simply be forced to bypass this gate.
+
+Native validation on 2026-10-27: `build-windows.ps1 -Test` passes **48 tests**,
+including timer rollover/acknowledgement, DSP upload/readback and the transition
+from boot-ROM commands to runtime mode. Firmware, probes, full dumps and vendor
+tools remain local and are excluded from the public repository.
 
 ### Complete TFS image and current retail mount proof
 
@@ -33,17 +68,43 @@ or file data was manufactured by the host. The factory cluster size is unverifie
 `full-tfs-v4-retail-mount.mmio` confirms `r0=0` at `0x20d16b9a`,
 `0x21134ea8`, `0x20a00744` and `0x2112a362`; `0x2112a36a` has `r4=0`.
 The retail firmware therefore completes this filesystem initialization path.
-At 120,000,000 instructions it is at `0x201217b0`, without a memory fault,
-with one unchanged Samsung splash. Menu entry is still unverified.
+At 120,000,000 instructions it is still executing the power/idle path, without
+a memory fault and with one unchanged Samsung splash. Menu entry is unverified.
 
 `full-tfs-v4-wake-after-mount` stops before `0x2012179c` at 71,267,120
 instructions, after the successful mount. INTC mask `0x50302010=0x7fffffff`
 leaves only IRQ31 enabled. `TMD_System_Clock` remains zero and power register
-`0x50100004=0`. The guest flags at `0x304a20f4` are `0x4fe9fffe`; bit10 is
-clear, so the checks at `0x201217a4..bc` lead to the report at `0x201217be`.
-No `0x20d729c0` IRQ31 callback was observed. The 120 interrupts already taken
-are from the earlier I2C phase. This identifies the next power/wakeup lead;
-it does not establish the missing hardware event or justify forcing an IRQ.
+`0x50500004=0x02041099`. The guest flags at `0x304a20f4` are `0x4fe9fffe`,
+including bit 10. The instruction at `0x201217bc` therefore skips the diagnostic
+report at `0x201217be`; `0x201217b0` was only a sampling point, not a wait.
+
+Focused `wake-flow-1` tracing shows that `0x2012179c..0x201217d6` completes and
+the firmware repeats the surrounding sleep/idle cycle. Consecutive entries are
+about 441 guest instructions apart. The cycle masks all but IRQ31, calls the RAM
+sleep stub at `0x31f00140`, restores the previous mask and returns to scheduler
+work. No IRQ31 or wake-status event occurs in the model; the 120 interrupts in
+the report belong to the earlier I2C phase. This is an active repeated idle path,
+not a firmware hang at one instruction.
+
+The RAM block `0x31f00000..0x31f001ac` is an exact copy of CLA bytes
+`0x2189a4f4..0x2189a6a0`. It contains ARM sleep stubs at `0x31f00090` and
+`0x31f00140`; both set bit `0x400` in the halfword at `0x50502000`, and the
+second first performs cache/prefetch drain operations. Veneers at `0x200827a8`
+and `0x204bd074` target `0x31f00140`; `0x204bd060` targets `0x31f00090`.
+Read-only trace `wake-stub-copy-3` observes the complete copy at instructions
+53,652,746..53,652,831: the bulk stores execute at `0x204af708/0x204af710`,
+with final stores at `0x204af72c/0x204af73c`. Thus the RAM code is installed by
+the retail firmware during initialization; it is not seeded by the emulator.
+
+The IRQ31 dispatch data is also now resolved without raising the interrupt.
+The vector `0x20cb0cd0` selects generic handler `0x208a0fd8` with context
+`0x309a2d9c` (`line=31`, controller base `0x50502000`). Its Thumb dispatcher
+`0x20010a40` indexes the 20-byte entry at `0x309a13e8`, calls `0x200140cc`,
+then the ARM veneer at `0x200107e8` reaches callback `0x20d729c0`. The word at
+`0x200107f0` is that veneer's literal, not another veneer. Runtime table words
+match the static table at `0x218c3508`. This establishes the callback chain but
+not the missing wake source, status lifecycle, or semantics of `0x50502010`,
+`0x50502014`, `0x50501000` and `0x50501008`; forcing IRQ31 is not justified.
 
 Cold STL recovery previously rejected the headers because main-area ECC was
 absent. `0x3000d5cc` examines OOB bytes 8..10; programmed headers deliberately
@@ -293,7 +354,8 @@ part of source/binary distribution. Current device implementation is separate.
 
 IRQ 29 is DMA: its callback at `0x208c8244` reads status at `0x50100000`.
 `0x30900168` is not the system clock: byte `0x30900169` tracks nesting depth.
-The actual RTOS clock is at `0x309011f0` and remains zero in the current probe.
+The actual RTOS clock is at `0x309011f0`. It was zero in the earlier mount/wake
+probes; the later timer-enabled probe observes 605 as described above.
 
 Normal tick path: `0x200117d4` -> `0x20848732`. IRQ20 has callback
 `0x200117d5`, but its generic handler is still zero and line20 is masked at the
@@ -307,15 +369,16 @@ device status persists until the device is acknowledged. Concurrent sources
 currently choose the highest bit; actual priority register semantics are TODO.
 IRQ entry respects CPSR.I. Force IRQ, SEED_NUCLEUS and CLOCK_ACCEL bridges have
 been removed. The opt-in E830_TIMER_PERIOD/E830_TIMER_IRQ source is diagnostic,
-not a validated hardware timer. The counter at `0x50501000` still advances per
-read and needs replacement with the correct frame timer behavior.
+not a validated hardware timer. The counter at `0x50501000` now advances with
+guest instruction progress, with provisional rollover and period-latch behavior
+described above; accurate physical timing still needs verification.
 
 ## Next work
 
-1. Investigate the retail power/scheduler path after successful filesystem mount.
-2. Validate resource reads through the retail firmware and later menu gates.
-3. Complete the frame/tick timer and actual interrupt priorities.
-4. Identify I2C slave `0x09`, DSP/mailbox behavior and remaining phone devices.
+1. Identify documented RD16024 instruction encodings and DSP-side startup signaling.
+2. Implement only confirmed DSP behavior, then probe beyond `0x2098cddc`.
+3. Validate retail resource reads and later menu gates without firmware patches.
+4. Complete physical timer timing, interrupt priorities and I2C slave `0x09`.
 
 Keep the real firmware untouched, preserve the desktop interface, and record
 new evidence here. A missing filesystem must not be bypassed with RTOS state,
