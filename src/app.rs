@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Color32, Rect, RichText, Sense, Vec2};
 use serde::{Deserialize, Serialize};
 
-use crate::runner::{classify_firmware_files, FirmwarePaths, Worker, WorkerEvent};
+use crate::runner::{classify_firmware_files, validate_nand_image, FirmwarePaths, Worker, WorkerEvent};
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -33,14 +33,19 @@ impl Settings {
 #[derive(PartialEq)]
 enum Screen { Library, Settings, Run }
 
+enum FileDialogEvent {
+    Firmware(Result<FirmwarePaths, String>),
+    Nand(Option<PathBuf>),
+}
+
 pub struct E830Launcher {
     root: PathBuf,
     config: Settings,
     config_draft: Option<Settings>,
     screen: Screen,
     worker: Option<Worker>,
-    events_tx: Sender<Result<FirmwarePaths, String>>,
-    events_rx: Receiver<Result<FirmwarePaths, String>>,
+    events_tx: Sender<FileDialogEvent>,
+    events_rx: Receiver<FileDialogEvent>,
     dialog_open: bool,
     running: bool,
     status: String,
@@ -77,6 +82,12 @@ impl E830Launcher {
     }
 
     fn spawn_e830_run(&mut self, paths: FirmwarePaths) {
+        if let Some(nand) = paths.onenand_path() {
+            if let Err(error) = validate_nand_image(&nand) {
+                self.status = error;
+                return;
+            }
+        }
         self.stop();
         self.config.last_import_dir = paths.cla.parent().map(|path| path.to_path_buf());
         self.config.firmware = Some(paths.clone());
@@ -106,18 +117,57 @@ impl E830Launcher {
                 .add_filter("E830 firmware (.cla / .nsf / .tfs)", &["cla", "CLA", "nsf", "NSF", "tfs", "TFS"])
                 .set_directory(directory).pick_files();
             let result = selection.map(classify_firmware_files).unwrap_or_else(|| Err("cancelled".into()));
-            let _ = sender.send(result);
+            let _ = sender.send(FileDialogEvent::Firmware(result));
         });
         self.status = "Select the matching .cla firmware and .nsf EEPROM; .tfs is optional.".into();
     }
 
+    fn spawn_nand_file_dialog(&mut self) {
+        if self.dialog_open { return; }
+        let Some(paths) = self.config.firmware.as_ref() else { return; };
+        self.dialog_open = true;
+        let directory = paths.onenand_path().and_then(|path| path.parent().map(PathBuf::from))
+            .unwrap_or_else(|| paths.cla.parent().unwrap_or(&self.root).to_path_buf());
+        let sender = self.events_tx.clone();
+        std::thread::spawn(move || {
+            let selection = rfd::FileDialog::new()
+                .set_title("Select E830 physical OneNAND image (32 MiB)")
+                .add_filter("Physical NAND image", &["bin", "BIN", "img", "IMG", "nand", "NAND"])
+                .add_filter("All files", &["*"])
+                .set_directory(directory).pick_file();
+            let _ = sender.send(FileDialogEvent::Nand(selection));
+        });
+        self.status = "Select 32 MiB main-only or 1024+32 interleaved NAND; source files are never overwritten.".into();
+    }
+
     fn drain_events(&mut self, ctx: &egui::Context) {
-        while let Ok(result) = self.events_rx.try_recv() {
+        while let Ok(event) = self.events_rx.try_recv() {
             self.dialog_open = false;
-            match result {
-                Ok(paths) => self.spawn_e830_run(paths),
-                Err(error) if error == "cancelled" => self.status = "Firmware selection cancelled.".into(),
-                Err(error) => self.status = format!("E830 firmware selection failed: {error}"),
+            match event {
+                FileDialogEvent::Firmware(Ok(mut paths)) => {
+                    // Re-selecting the same CLA keeps its chosen NAND; a new
+                    // firmware set starts with its own automatic sibling lookup.
+                    if let Some(previous) = self.config.firmware.as_ref() {
+                        if previous.cla == paths.cla { paths.onenand = previous.onenand.clone(); }
+                    }
+                    self.spawn_e830_run(paths);
+                }
+                FileDialogEvent::Firmware(Err(error)) if error == "cancelled" =>
+                    self.status = "Firmware selection cancelled.".into(),
+                FileDialogEvent::Firmware(Err(error)) =>
+                    self.status = format!("E830 firmware selection failed: {error}"),
+                FileDialogEvent::Nand(Some(path)) => {
+                    if let Err(error) = validate_nand_image(&path) {
+                        self.status = error;
+                        continue;
+                    }
+                    self.stop();
+                    if let Some(paths) = self.config.firmware.as_mut() { paths.onenand = Some(path); }
+                    self.status = "NAND selected. Press Run to restart from reset; the source image is read-only.".into();
+                    self.save_settings();
+                    self.screen = Screen::Library;
+                }
+                FileDialogEvent::Nand(None) => self.status = "NAND selection cancelled.".into(),
             }
         }
         let mut latest = None;
@@ -192,6 +242,26 @@ impl E830Launcher {
         card_ui.label("176 × 220 LCD");
         card_ui.add_space(16.0);
         if card_ui.button("Run").clicked() || response.double_clicked() { self.spawn_e830_run(paths); }
+        ui.add_space(12.0);
+        if let Some(paths) = self.config.firmware.as_ref() {
+            match paths.onenand_path() {
+                Some(path) => { ui.label(format!("NAND: {}", path.display())); }
+                None => { ui.label("NAND: no image (erased flash)"); }
+            }
+        }
+        ui.horizontal(|ui| {
+            if ui.add_enabled(!self.dialog_open, egui::Button::new("Select NAND...")).clicked() {
+                self.spawn_nand_file_dialog();
+            }
+            let explicit = self.config.firmware.as_ref().is_some_and(|paths| paths.onenand.is_some());
+            if ui.add_enabled(!self.dialog_open && explicit, egui::Button::new("Use automatic NAND")).clicked() {
+                self.stop();
+                if let Some(paths) = self.config.firmware.as_mut() { paths.onenand = None; }
+                self.status = "Automatic NAND selected: CLA-stem.onenand.bin beside the firmware, or erased flash.".into();
+                self.save_settings();
+            }
+        });
+        ui.label(RichText::new("32 MiB main-only or 1024+32 per page. TFS is not a NAND image.").small());
         if self.running {
             ui.add_space(12.0);
             if ui.button("Show run output").clicked() { self.screen = Screen::Run; }
@@ -325,5 +395,50 @@ impl FrameStats {
         let last_ms = self.last_frame_ms.unwrap_or(0.0);
         let since_ms = self.last_frame_at.map(|time| time.elapsed().as_secs_f32() * 1000.0).unwrap_or(0.0);
         format!("FPS {:.1}  Frames {}  Last {:.0}ms  Since {:.0}ms", self.fps, self.displayed_frames, last_ms, since_ms)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn launcher() -> E830Launcher {
+        let config: Settings = serde_json::from_str(r#"{
+            "firmware":{"cla":"test.cla","eeprom":"test.nsf","tfs":null,"onenand":"selected.bin"}
+        }"#).unwrap();
+        E830Launcher::new(std::env::temp_dir(), config)
+    }
+
+    #[test]
+    fn settings_round_trip_preserves_selected_nand() {
+        let app = launcher();
+        let settings: Settings = serde_json::from_slice(&serde_json::to_vec(&app.config).unwrap()).unwrap();
+        assert_eq!(settings.firmware.unwrap().onenand, Some("selected.bin".into()));
+        let old: Settings = serde_json::from_str(r#"{"firmware":{"cla":"test.cla","eeprom":"test.nsf","tfs":null}}"#).unwrap();
+        assert!(old.firmware.unwrap().onenand.is_none());
+    }
+
+    #[test]
+    fn cancelled_nand_dialog_keeps_existing_selection() {
+        let mut app = launcher();
+        app.dialog_open = true;
+        app.events_tx.send(FileDialogEvent::Nand(None)).unwrap();
+        app.drain_events(&egui::Context::default());
+        assert!(!app.dialog_open);
+        assert_eq!(app.config.firmware.unwrap().onenand, Some("selected.bin".into()));
+        assert_eq!(app.status, "NAND selection cancelled.");
+    }
+
+    #[test]
+    fn invalid_nand_dialog_keeps_existing_selection_and_running_state() {
+        let mut app = launcher();
+        app.running = true;
+        app.dialog_open = true;
+        app.events_tx.send(FileDialogEvent::Nand(Some(app.root.clone()))).unwrap();
+        app.drain_events(&egui::Context::default());
+        assert!(!app.dialog_open);
+        assert!(app.running);
+        assert_eq!(app.config.firmware.unwrap().onenand, Some("selected.bin".into()));
+        assert!(app.status.contains("directory"));
     }
 }
