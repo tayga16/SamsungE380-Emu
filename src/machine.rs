@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crate::cpu::{EngineProt as Prot, HookType, RegisterARM, Unicorn, Arm946Cpu};
 use crate::cpu::{arm_condition_passed, TcmRegisters, E830_DTCM_BASE, E830_TCM_SIZE};
 use thiserror::Error;
+use unicorn_engine::Context;
 
 use crate::{
     FirmwareSet, E830_TFS_SOURCE_BASE, FLASH_BASE,
@@ -24,6 +25,7 @@ const DSP_BOOT_MMIO_SIZE: u64 = PAGE_SIZE;
 // 0x60000008 and 0x600007e0). Storage only; DSP execution is not implemented.
 const DSP_SHARED_RAM_BASE: u64 = 0x6000_0000;
 const DSP_SHARED_RAM_SIZE: u64 = 0x0001_0000;
+const E830_DSP_STARTUP_MAGIC: u32 = 0x7073_2b02;
 const ONENAND_BASE: u64 = 0x4800_0000;
 const ONENAND_SIZE: u64 = 0x0002_0000;
 
@@ -42,7 +44,23 @@ const SOC_SECONDARY_REGISTER_SIZE: u64 = 0x0001_0000;
 const UART_BASES: [u32; 2] = [0x5040_3000, 0x5040_4000];
 const I2C_BASE: u32 = 0x5040_5000;
 const I2C_IRQ: u32 = 28;
+const SERIAL_BASE: u32 = 0x5040_8000;
 const SYSTEM_TIMER_IRQ: u32 = 20;
+const SYSTEM_TIMER_MATCH_IRQ: u32 = 21;
+const SYSTEM_TIMER_CPU_CLOCK_RATIO: u64 = 8;
+// Timer API commands at 0x2051e8dc/0x2051ebb4 independently set and clear
+// these match-channel bits. Firmware uses period +0x0c = 5000, match0 +0x10 =
+// 0 and match1 +0x14 = 4700.
+const SYSTEM_TIMER_MATCH0_ENABLE: u32 = 0x200;
+const SYSTEM_TIMER_MATCH1_ENABLE: u32 = 0x400;
+const SYSTEM_TIMER_MATCH_CHANNELS: u32 =
+    SYSTEM_TIMER_MATCH0_ENABLE | SYSTEM_TIMER_MATCH1_ENABLE;
+const SYSTEM_TIMER_IRQ20_ENABLE: u32 = 0x20;
+const SYSTEM_TIMER_IRQ21_ENABLE: u32 = 0x40;
+const SYSTEM_TIMER_IRQ20_STATUS: u32 = 0x80;
+const SYSTEM_TIMER_IRQ21_STATUS: u32 = 0x100;
+const SYSTEM_TIMER_STATUS_MASK: u32 =
+    SYSTEM_TIMER_IRQ20_STATUS | SYSTEM_TIMER_IRQ21_STATUS;
 const SOC_POWER_CONTROL_BASE: u64 = 0x5010_0000;
 const SOC_POWER_CONTROL_SIZE: u64 = 0x0001_0000;
 const SOC_REGISTER_BASE: u64 = 0x5050_0000;
@@ -61,6 +79,22 @@ const RTOS_GLOBALS_TRACE_END: u64 = 0x3090_01bf;
 const RTOS_NESTING_DEPTH: u64 = 0x3090_0169;
 const DSP_CONTROL_BASE: u64 = 0x6010_0000;
 const DSP_MAILBOX_BASE: u64 = 0x6000_0640;
+const DSP_SIGNAL_BASE: u32 = 0x5050_5000;
+const DSP_START_SIGNAL: u32 = DSP_SIGNAL_BASE + 0x10;
+const DSP_RUNTIME_SIGNAL: u32 = DSP_SIGNAL_BASE + 0x18;
+const E830_DSP_SPACE0_WORDS: usize = 0x6000;
+const E830_DSP_SPACE1_START: u16 = 0x7000;
+const E830_DSP_SPACE1_WORDS: usize = 0x1000;
+const E830_DSP_SPACE0_FNV64: u64 = 0xb25c_3385_c96d_670d;
+const E830_DSP_SPACE1_FNV64: u64 = 0xe39e_195e_7cdc_9922;
+const DSP_ASYNC_QUEUE: u32 = 0x30a2_c354;
+const DSP_ASYNC_CALLBACK: u32 = 0x215a_7cb9;
+const DSP_ASYNC_EVENT_HANDLER: u32 = 0x204d_0389;
+const DSP_ASYNC_EVENT_HANDLER_PC: u64 = 0x204d_0388;
+const DSP_ASYNC_COMPLETE: u32 = 0x2112_2085;
+const DSP_ASYNC_TRAMPOLINE: u64 = 0x1fff_f000;
+const DSP_ASYNC_START_DELAY: u64 = 256;
+const DSP_ASYNC_COMPLETE_DELAY: u64 = 4096;
 const DSP_TRACE_PCS: [u64; 10] = [
     0x2098_c180,
     0x2098_c188,
@@ -161,6 +195,40 @@ fn env_u64(name: &str) -> Option<u64> {
     }
 }
 
+fn interrupt_delivery_allowed(cpsr: u32, in_service: bool) -> bool {
+    cpsr & CPSR_IRQ_DISABLE == 0
+        && cpsr & CPSR_MODE_MASK != CPSR_MODE_IRQ
+        && !in_service
+}
+
+fn interrupt_service_returned(
+    cpsr: u32,
+    in_service: bool,
+    eoi_seen: bool,
+    nesting: u8,
+    entry_nesting: u8,
+) -> bool {
+    in_service
+        && eoi_seen
+        && cpsr & CPSR_IRQ_DISABLE == 0
+        && cpsr & CPSR_MODE_MASK != CPSR_MODE_IRQ
+        && nesting <= entry_nesting
+}
+
+fn periodic_timer_crossed(start: u16, ticks: u64, period: u16, target: u16) -> bool {
+    if ticks == 0 || period == 0 || target >= period {
+        return false;
+    }
+    let period = u64::from(period);
+    let start = u64::from(start) % period;
+    let target = u64::from(target);
+    let distance = if target > start {
+        target - start
+    } else {
+        period - start + target
+    };
+    ticks >= distance
+}
 
 #[derive(Debug, Error)]
 pub enum MachineError {
@@ -241,6 +309,10 @@ pub struct BootReport {
 enum DspBootParser {
     Command,
     Running,
+    RuntimeReadArguments {
+        memory_space: u8,
+        address: Option<u16>,
+    },
     Arguments {
         command: u16,
         address: Option<u16>,
@@ -252,6 +324,29 @@ enum DspBootParser {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DspEvent {
+    StartupReady,
+    RuntimeReady,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DspHlePhase {
+    Disabled,
+    AwaitingStart,
+    E830Running,
+    E830RuntimeReady,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DspQueueHlePhase {
+    Idle,
+    StartPending { deadline: u64 },
+    StartRunning,
+    CompletePending { deadline: u64 },
+    CompleteRunning,
+}
+
 #[derive(Debug)]
 struct DspBootInterface {
     control: u32,
@@ -260,10 +355,18 @@ struct DspBootInterface {
     parser: DspBootParser,
     rx_fifo: VecDeque<u16>,
     memories: [HashMap<u16, u16>; 2],
+    hle_phase: DspHlePhase,
+    runtime_completion_pending: bool,
 }
 
 impl Default for DspBootInterface {
     fn default() -> Self {
+        Self::new(false)
+    }
+}
+
+impl DspBootInterface {
+    fn new(hle_enabled: bool) -> Self {
         Self {
             control: 0,
             last_tx: 0,
@@ -271,11 +374,15 @@ impl Default for DspBootInterface {
             parser: DspBootParser::Command,
             rx_fifo: VecDeque::new(),
             memories: Default::default(),
+            hle_phase: if hle_enabled {
+                DspHlePhase::AwaitingStart
+            } else {
+                DspHlePhase::Disabled
+            },
+            runtime_completion_pending: false,
         }
     }
-}
 
-impl DspBootInterface {
     const TX_READY: u32 = 1 << 0;
     const RX_READY: u32 = 1 << 1;
 
@@ -294,6 +401,20 @@ impl DspBootInterface {
         ]
     }
 
+    fn memory_snapshot(&self, memory_space: usize) -> Option<Vec<u8>> {
+        let memory = self.memories.get(memory_space)?;
+        let words = match memory_space {
+            0 => 0x1_0000,
+            1 => 0x1_0000,
+            _ => return None,
+        };
+        let mut bytes = Vec::with_capacity(words * 2);
+        for address in 0..words {
+            bytes.extend_from_slice(&memory.get(&(address as u16)).copied().unwrap_or(0).to_le_bytes());
+        }
+        Some(bytes)
+    }
+
     fn read(&mut self, address: u32, size: usize) -> u64 {
         let offset = address.wrapping_sub(DSP_CONTROL_BASE as u32);
         let aligned = offset & !3;
@@ -308,13 +429,12 @@ impl DspBootInterface {
         u64::from((raw >> shift) & width_mask(size))
     }
 
-    fn write(&mut self, address: u32, size: usize, value: u64) {
+    fn write(&mut self, address: u32, size: usize, value: u64) -> Option<DspEvent> {
         let offset = address.wrapping_sub(DSP_CONTROL_BASE as u32);
         let aligned = offset & !3;
         if aligned == 8 {
             self.last_tx = value as u16;
-            self.transmit(self.last_tx);
-            return;
+            return self.transmit(self.last_tx);
         }
 
         let shift = (offset & 3) * 8;
@@ -328,9 +448,21 @@ impl DspBootInterface {
             12 => update(&mut self.auxiliary),
             _ => {}
         }
+        None
     }
 
-    fn transmit(&mut self, word: u16) {
+    fn transmit(&mut self, word: u16) -> Option<DspEvent> {
+        if std::env::var_os("E830_TRACE_DSP_TX").is_some()
+            && matches!(
+                self.hle_phase,
+                DspHlePhase::E830Running | DspHlePhase::E830RuntimeReady
+            )
+        {
+            eprintln!(
+                "[e830-dsp-tx] parser={:?} phase={:?} word=0x{word:04x}",
+                self.parser, self.hle_phase
+            );
+        }
         match self.parser {
             DspBootParser::Command => match word {
                 0x000b => self.rx_fifo.push_back(0x0305),
@@ -349,10 +481,68 @@ impl DspBootInterface {
                 // Start execution takes one address word and has no boot-ROM
                 // response. DSP execution itself is not implemented here.
                 self.parser = DspBootParser::Running;
+                if self.hle_phase == DspHlePhase::AwaitingStart
+                    && word == 0
+                    && self.matches_e830_image()
+                {
+                    self.hle_phase = DspHlePhase::E830Running;
+                    return Some(DspEvent::StartupReady);
+                }
+                self.hle_phase = DspHlePhase::Disabled;
             }
             DspBootParser::Running => {
-                // Once execution starts, words belong to the runtime mailbox
-                // protocol and must not be reinterpreted as boot-ROM commands.
+                if matches!(self.hle_phase, DspHlePhase::E830Running | DspHlePhase::E830RuntimeReady) {
+                    match word {
+                        // The ARM continues using the boot interface's two
+                        // established read commands after DSP start to verify
+                        // and copy overlays. Return only bytes uploaded earlier.
+                        0x0005 | 0x0006 => {
+                            self.parser = DspBootParser::RuntimeReadArguments {
+                                memory_space: if word == 0x0005 { 0 } else { 1 },
+                                address: None,
+                            };
+                        }
+                        0x1001 => {
+                            // This command has two observed phases: the DSP
+                            // accepts it, then raises the same signal again
+                            // after the ARM acknowledges the first event.
+                            self.runtime_completion_pending = true;
+                            self.hle_phase = DspHlePhase::E830RuntimeReady;
+                            return Some(DspEvent::RuntimeReady);
+                        }
+                        0x1002 | 0x2001 => {
+                            // Retail call sites send these commands and wait
+                            // for one DSP runtime event before returning.
+                            // Without RD16024 execution, model only that
+                            // observed completion notification.
+                            self.hle_phase = DspHlePhase::E830RuntimeReady;
+                            return Some(DspEvent::RuntimeReady);
+                        }
+                        0x4001 => {
+                            self.hle_phase = DspHlePhase::E830RuntimeReady;
+                            return Some(DspEvent::RuntimeReady);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            DspBootParser::RuntimeReadArguments { memory_space, address: None } => {
+                self.parser = DspBootParser::RuntimeReadArguments {
+                    memory_space,
+                    address: Some(word),
+                };
+            }
+            DspBootParser::RuntimeReadArguments { memory_space, address: Some(address) } => {
+                for index in 0..word {
+                    let location = address.wrapping_add(index);
+                    self.rx_fifo.push_back(
+                        self.memories[memory_space as usize]
+                            .get(&location)
+                            .copied()
+                            .unwrap_or(0),
+                    );
+                }
+                self.parser = DspBootParser::Running;
             }
             DspBootParser::Arguments { command, address: None } => {
                 self.parser = DspBootParser::Arguments {
@@ -369,7 +559,7 @@ impl DspBootInterface {
                     0x0002 | 0x0006 => 1,
                     _ => {
                         self.parser = DspBootParser::Command;
-                        return;
+                        return None;
                     }
                 };
                 if matches!(command, 0x0001 | 0x0002) {
@@ -412,7 +602,42 @@ impl DspBootInterface {
                 };
             }
         }
+        None
     }
+
+    fn matches_e830_image(&self) -> bool {
+        self.memories[0].len() == E830_DSP_SPACE0_WORDS
+            && self.memories[1].len() == E830_DSP_SPACE1_WORDS
+            && self.memory_hash(0, 0, E830_DSP_SPACE0_WORDS) == Some(E830_DSP_SPACE0_FNV64)
+            && self.memory_hash(1, E830_DSP_SPACE1_START, E830_DSP_SPACE1_WORDS)
+                == Some(E830_DSP_SPACE1_FNV64)
+    }
+
+    fn memory_hash(&self, space: usize, start: u16, count: usize) -> Option<u64> {
+        let memory = self.memories.get(space)?;
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for offset in 0..count {
+            let address = usize::from(start).checked_add(offset)?;
+            let word = memory.get(&(u16::try_from(address).ok()?))?;
+            for byte in word.to_le_bytes() {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        Some(hash)
+    }
+
+    fn runtime_signal_acknowledged(&mut self) -> bool {
+        std::mem::take(&mut self.runtime_completion_pending)
+    }
+
+    fn runtime_hle_active(&self) -> bool {
+        matches!(
+            self.hle_phase,
+            DspHlePhase::E830Running | DspHlePhase::E830RuntimeReady
+        )
+    }
+
 }
 
 struct E830State {
@@ -428,7 +653,9 @@ struct E830State {
     standby_look_entries: u64,
     timer_counter: u16,
     timer_last_update: u64,
+    timer_clock_remainder: u64,
     system_timer_irq_pending: bool,
+    system_timer_match_irq_pending: bool,
     instructions: u64,
     fast_forwarded_instructions: u64,
     instruction_budget: u64,
@@ -444,6 +671,7 @@ struct E830State {
     tcm_registers: TcmRegisters,
     uarts: [crate::uart::Uart; 2],
     i2c: crate::i2c::I2c,
+    serial: crate::serial::SerialController,
     onenand: crate::onenand::OneNand,
     active_irq_line: u32,
     // Optional diagnostic source, separate from hardware devices.
@@ -454,6 +682,8 @@ struct E830State {
     // Handlers may switch to System mode while servicing an IRQ. Block another
     // delivery until EOI instead of relying on CPU mode alone.
     timer_irq_in_service: bool,
+    irq_eoi_seen: bool,
+    irq_entry_nesting: u8,
     irqs_taken: u64,
     // Diagnostic: when `pc_log_remaining` is non-zero and the executed
     // instruction count has passed `pc_log_after`, each real (non
@@ -504,6 +734,9 @@ struct E830State {
     trace_dsp_after: u64,
     trace_dsp_remaining: u64,
     trace_dsp_last: Option<(u64, [u32; 8])>,
+    dsp_completion_context: Option<Context>,
+    dsp_queue_hle_phase: DspQueueHlePhase,
+    dsp_queue_head: u32,
 }
 
 impl E830State {
@@ -519,7 +752,7 @@ impl E830State {
         registers.insert(SOC_BOOT_READY_INPUT_REGISTER, SOC_BOOT_READY_INPUT_MASK);
         Self {
             registers,
-            dsp_boot: Default::default(),
+            dsp_boot: DspBootInterface::new(std::env::var_os("E830_DSP_BOOT_HLE").is_some()),
             nor: crate::nor::NorFlash::new(flash),
             lcd_bus_mode: 0,
             lcd_register_index: 0,
@@ -530,7 +763,9 @@ impl E830State {
             standby_look_entries: 0,
             timer_counter: 0,
             timer_last_update: 0,
+            timer_clock_remainder: 0,
             system_timer_irq_pending: false,
+            system_timer_match_irq_pending: false,
             instructions: 0,
             fast_forwarded_instructions: 0,
             instruction_budget: u64::MAX,
@@ -546,6 +781,7 @@ impl E830State {
             tcm_registers: TcmRegisters::default(),
             uarts: Default::default(),
             i2c: Default::default(),
+            serial: Default::default(),
             onenand: Default::default(),
             active_irq_line: 0,
             timer_irq_index: env_u64("E830_TIMER_IRQ")
@@ -556,6 +792,8 @@ impl E830State {
             timer_irq_counter: 0,
             timer_irq_pending: false,
             timer_irq_in_service: false,
+            irq_eoi_seen: false,
+            irq_entry_nesting: 0,
             irqs_taken: 0,
             pc_log_after: env_u64("E830_PC_LOG_AFTER").unwrap_or(0),
             pc_log_remaining: env_u64("E830_PC_LOG").unwrap_or(0),
@@ -591,6 +829,9 @@ impl E830State {
             trace_dsp_after: env_u64("E830_TRACE_DSP_AFTER").unwrap_or(0),
             trace_dsp_remaining: env_u64("E830_TRACE_DSP_LIMIT").unwrap_or(1000),
             trace_dsp_last: None,
+            dsp_completion_context: None,
+            dsp_queue_hle_phase: DspQueueHlePhase::Idle,
+            dsp_queue_head: 0,
         }
     }
 
@@ -646,15 +887,15 @@ impl E830State {
         {
             let action = if access.write { "write" } else { "read" };
             let total = self.instructions.saturating_add(self.fast_forwarded_instructions);
-            let timer_line_masked = self
+            let interrupt_mask = self
                 .registers
                 .get(&INTC_ENABLE_MASK_REGISTER)
                 .copied()
-                .unwrap_or(u32::MAX)
-                & (1 << 20)
-                != 0;
+                .unwrap_or(u32::MAX);
+            let irq20_masked = interrupt_mask & (1 << SYSTEM_TIMER_IRQ) != 0;
+            let irq21_masked = interrupt_mask & (1 << SYSTEM_TIMER_MATCH_IRQ) != 0;
             self.trace_timer_line(format!(
-                "mmio {action} addr=0x{:08x} size={} value=0x{:08x} pc=0x{:08x} irq20_masked={timer_line_masked} insns={total}",
+                "mmio {action} addr=0x{:08x} size={} value=0x{:08x} pc=0x{:08x} irq20_masked={irq20_masked} irq21_masked={irq21_masked} insns={total}",
                 access.address, access.size, access.value, access.pc
             ));
         }
@@ -665,29 +906,67 @@ impl E830State {
     fn pending_lines(&self) -> u32 {
         let diagnostic = if self.timer_irq_pending { 1 << (self.timer_irq_index & 31) } else { 0 };
         let system_timer = if self.system_timer_irq_pending { 1 << SYSTEM_TIMER_IRQ } else { 0 };
+        let system_timer_match = if self.system_timer_match_irq_pending {
+            1 << SYSTEM_TIMER_MATCH_IRQ
+        } else {
+            0
+        };
         let i2c = if self.i2c.irq_pending() { 1 << I2C_IRQ } else { 0 };
-        diagnostic | system_timer | i2c
+        diagnostic | system_timer | system_timer_match | i2c
     }
 
     fn advance_system_timer(&mut self, now: u64) {
         let elapsed = now.saturating_sub(self.timer_last_update);
         self.timer_last_update = now;
-        if elapsed == 0 {
+        let clocks = self.timer_clock_remainder.saturating_add(elapsed);
+        let ticks = clocks / SYSTEM_TIMER_CPU_CLOCK_RATIO;
+        self.timer_clock_remainder = clocks % SYSTEM_TIMER_CPU_CLOCK_RATIO;
+        if ticks == 0 {
             return;
         }
 
-        let wraps = elapsed > u64::from(u16::MAX - self.timer_counter);
-        self.timer_counter = self.timer_counter.wrapping_add(elapsed as u16);
         let control = self.registers.get(&(SOC_TIMER + 8)).copied().unwrap_or(0);
-        if wraps && control & 0x40 != 0 {
-            // The firmware programs the next timer period at +0x14.  With the
-            // reload bit set, hardware publishes it as the active period at
-            // +0x0c on rollover; delay bookkeeping relies on that transition.
-            let reload = self.registers.get(&(SOC_TIMER + 0x14)).copied().unwrap_or(0);
-            self.registers.insert(SOC_TIMER + 0x0c, reload & 0xffff);
+        let period = self
+            .registers
+            .get(&(SOC_TIMER + 0x0c))
+            .copied()
+            .unwrap_or(0) as u16;
+        let match0 = self
+            .registers
+            .get(&(SOC_TIMER + 0x10))
+            .copied()
+            .unwrap_or(0) as u16;
+        let match1 = self
+            .registers
+            .get(&(SOC_TIMER + 0x14))
+            .copied()
+            .unwrap_or(0) as u16;
+        if control & SYSTEM_TIMER_MATCH_CHANNELS == SYSTEM_TIMER_MATCH_CHANNELS && period != 0 {
+            let previous_counter = self.timer_counter;
+            let match0_crossed = periodic_timer_crossed(previous_counter, ticks, period, match0);
+            let match1_crossed = periodic_timer_crossed(previous_counter, ticks, period, match1);
+            // The period wraps at 5000. Match0 is zero, so IRQ20 appears at
+            // the boundary; match1 occurs 300 ticks earlier and drives IRQ21.
+            self.timer_counter = ((u64::from(previous_counter) + ticks) % u64::from(period)) as u16;
+            if match0_crossed && control & SYSTEM_TIMER_IRQ20_ENABLE != 0 {
+                *self.registers.entry(SOC_TIMER + 8).or_default() |=
+                    SYSTEM_TIMER_IRQ20_STATUS;
+                self.system_timer_irq_pending = true;
+            }
+            if match1_crossed && control & SYSTEM_TIMER_IRQ21_ENABLE != 0 {
+                *self.registers.entry(SOC_TIMER + 8).or_default() |=
+                    SYSTEM_TIMER_IRQ21_STATUS;
+                self.system_timer_match_irq_pending = true;
+            }
+            return;
         }
-        if wraps && control & 0x20 != 0 {
-            *self.registers.entry(SOC_TIMER + 8).or_default() |= 0x80;
+
+        let previous_counter = self.timer_counter;
+        let wraps = ticks > u64::from(u16::MAX - previous_counter);
+        self.timer_counter = previous_counter.wrapping_add(ticks as u16);
+        if wraps && control & SYSTEM_TIMER_IRQ20_ENABLE != 0 {
+            *self.registers.entry(SOC_TIMER + 8).or_default() |=
+                SYSTEM_TIMER_IRQ20_STATUS;
             self.system_timer_irq_pending = true;
         }
     }
@@ -716,6 +995,8 @@ impl E830State {
             self.uarts[channel].read(aligned - base)
         } else if aligned >= I2C_BASE && aligned < I2C_BASE + 0x30 {
             self.i2c.read(aligned - I2C_BASE)
+        } else if aligned >= SERIAL_BASE && aligned < SERIAL_BASE + 0x20 {
+            return self.serial.read(address - SERIAL_BASE, size);
         } else if SOC_KEYPAD_SCAN_READ_PCS.contains(&pc)
             && SOC_KEYPAD_INPUT_REGISTERS.contains(&aligned)
         {
@@ -746,52 +1027,97 @@ impl E830State {
         u64::from((raw >> shift) & mask)
     }
 
-    fn write_register(&mut self, address: u32, size: usize, value: u64) {
+    fn write_register(&mut self, address: u32, size: usize, value: u64) -> Option<DspEvent> {
         if u64::from(address) >= DSP_CONTROL_BASE
             && u64::from(address) < DSP_CONTROL_BASE + DSP_BOOT_MMIO_SIZE
         {
-            self.dsp_boot.write(address, size, value);
-            return;
+            let event = self.dsp_boot.write(address, size, value);
+            match event {
+                Some(DspEvent::StartupReady) => {
+                    *self.registers.entry(DSP_START_SIGNAL).or_default() |= 1;
+                }
+                Some(DspEvent::RuntimeReady) => {
+                    *self.registers.entry(DSP_RUNTIME_SIGNAL).or_default() |= 1;
+                }
+                None => {}
+            }
+            return event;
         }
         if u64::from(address) >= ONENAND_BASE && u64::from(address) < ONENAND_BASE + ONENAND_SIZE {
             self.onenand.write(address - ONENAND_BASE as u32, size, value);
-            return;
+            return None;
         }
         let aligned = address & !3;
         if aligned >= I2C_BASE && aligned < I2C_BASE + 0x30 {
             let now = self.instructions.saturating_add(self.fast_forwarded_instructions);
             self.i2c.write(aligned - I2C_BASE, value as u32, now);
-            return;
+            return None;
+        }
+        if aligned >= SERIAL_BASE && aligned < SERIAL_BASE + 0x20 {
+            self.serial.write(address - SERIAL_BASE, size, value);
+            return None;
         }
         if let Some((channel, base)) = UART_BASES.iter().enumerate()
             .find(|(_, base)| aligned >= **base && aligned < **base + 0x20) {
             self.uarts[channel].write(aligned - base, value as u32);
-            return;
+            return None;
         }
         let shift = (address & 3) * 8;
         let value_mask = width_mask(size);
         let mask = value_mask.wrapping_shl(shift);
-        let updated = {
+        if matches!(aligned, DSP_START_SIGNAL | DSP_RUNTIME_SIGNAL) {
+            let written = ((value as u32) & value_mask).wrapping_shl(shift);
             let register = self.registers.entry(aligned).or_default();
-            *register = (*register & !mask) | (((value as u32).wrapping_shl(shift)) & mask);
+            *register = (*register & !mask) | ((*register & mask) & written);
+            if aligned == DSP_RUNTIME_SIGNAL
+                && *register & 1 == 0
+                && self.dsp_boot.runtime_signal_acknowledged()
+            {
+                *register |= 1;
+            }
+            return None;
+        }
+        let written = ((value as u32).wrapping_shl(shift)) & mask;
+        let updated = if aligned == SOC_TIMER + 8 {
+            // Bits 7 and 8 are device-owned interrupt status with write-zero-
+            // to-clear semantics. The remaining bits are ordinary writable
+            // timer mode/enable fields.
+            let previous = self.registers.get(&aligned).copied().unwrap_or(0);
+            let ordinary_mask = mask & !SYSTEM_TIMER_STATUS_MASK;
+            let status_mask = mask & SYSTEM_TIMER_STATUS_MASK;
+            let ordinary = (previous & !ordinary_mask) | (written & ordinary_mask);
+            let previous_status = previous & SYSTEM_TIMER_STATUS_MASK;
+            let status = previous_status & (!status_mask | written);
+            let updated = (ordinary & !SYSTEM_TIMER_STATUS_MASK) | status;
+            self.registers.insert(aligned, updated);
+            updated
+        } else {
+            let register = self.registers.entry(aligned).or_default();
+            *register = (*register & !mask) | written;
             *register
         };
-        if aligned == SOC_TIMER + 8 && updated & 0x80 == 0 {
+        if aligned == SOC_TIMER + 8 && updated & SYSTEM_TIMER_IRQ20_STATUS == 0 {
             // IRQ20 is a peripheral level. The firmware's handler clears the
             // timer's 0x80 status bit before the interrupt controller EOI.
             self.system_timer_irq_pending = false;
         }
+        if aligned == SOC_TIMER + 8 && updated & SYSTEM_TIMER_IRQ21_STATUS == 0 {
+            // IRQ21 is the early compare in the observed 0x600 periodic mode.
+            // The firmware acknowledges it independently with bit 8 clear.
+            self.system_timer_match_irq_pending = false;
+        }
         if aligned == SOC_INIT_CONTROL_REGISTER && updated & 0x80 != 0 {
             *self.registers.entry(SOC_INIT_STATUS_REGISTER).or_default() |= 0x07;
-            // The IRQ vector handler writes 0x80 here as its end-of-interrupt
-            // acknowledge (`strb` of 0x80 to 0x50302008). Drop the raised line
-            // so the next tick is a fresh edge rather than an immediate re-entry.
             if self.active_irq_line == self.timer_irq_index {
                 self.timer_irq_pending = false;
             }
-            self.timer_irq_in_service = false;
+            // The per-line dispatcher acknowledges before the IRQ wrapper has
+            // necessarily restored an interruptible task context. Remember the
+            // EOI, but keep the source in service until CPSR.I is actually clear.
+            self.irq_eoi_seen = true;
         }
         self.write_lcd_register(address, size, value);
+        None
     }
 
     fn write_lcd_register(&mut self, address: u32, size: usize, value: u64) {
@@ -866,12 +1192,14 @@ impl E830Machine {
             u64::from(FLASH_BASE),
             flash_size,
             Prot::ALL,
-            "mapping CLA flash",
+            "mapping the CLA working image",
         )?;
         cpu.mem_write(u64::from(FLASH_BASE), firmware.cla())
-            .map_err(|error| unicorn_error("loading CLA flash", error))?;
-        cpu.mem_protect(u64::from(FLASH_BASE), flash_size, Prot::READ | Prot::EXEC)
-            .map_err(|error| unicorn_error("protecting CLA flash", error))?;
+            .map_err(|error| unicorn_error("loading the CLA working image", error))?;
+        // The running image contains writable tables (for example the
+        // hau3 sequencer table at 0x2023e064). Keep this execution window
+        // writable while the separate 0xea000000 backing copy below remains
+        // read-only, so guest updates never modify the supplied CLA file.
         map_memory(
             cpu,
             E830_BOOT_ROM_MIRROR_BASE,
@@ -909,6 +1237,21 @@ impl E830Machine {
             cpu.mem_write(E830_TFS_SOURCE_BASE, &erased_window)
                 .map_err(|error| unicorn_error("initializing the empty TFS window", error))?;
         }
+        map_memory(
+            cpu,
+            DSP_ASYNC_TRAMPOLINE,
+            PAGE_SIZE,
+            Prot::ALL,
+            "mapping the DSP completion trampoline",
+        )?;
+        cpu.mem_write(DSP_ASYNC_TRAMPOLINE, &[0x00, 0xbf])
+            .map_err(|error| unicorn_error("loading the DSP completion trampoline", error))?;
+        cpu.mem_protect(
+            DSP_ASYNC_TRAMPOLINE,
+            PAGE_SIZE,
+            Prot::READ | Prot::EXEC,
+        )
+        .map_err(|error| unicorn_error("protecting the DSP completion trampoline", error))?;
         map_flash_window(cpu)?;
 
         let low_vector_image = &firmware.cla()[..LOW_VECTOR_SIZE as usize];
@@ -986,6 +1329,10 @@ impl E830Machine {
 
     pub fn onenand_snapshot(&mut self) -> Vec<u8> {
         self.cpu.raw_engine().get_data().onenand.snapshot()
+    }
+
+    pub fn dsp_memory_snapshot(&mut self, memory_space: usize) -> Option<Vec<u8>> {
+        self.cpu.raw_engine().get_data().dsp_boot.memory_snapshot(memory_space)
     }
 
     /// Copy installer arguments into mapped SDRAM; never modify firmware code.
@@ -1227,15 +1574,45 @@ fn map_mmio(
             move |uc: &mut Unicorn<'_, E830State>, offset, access_size, value| {
                 let address = (base + offset) as u32;
                 let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
-                let state = uc.get_data_mut();
-                state.write_register(address, access_size, value);
-                state.record_mmio(MmioAccess {
-                    write: true,
-                    address,
-                    size: access_size,
-                    value,
-                    pc,
-                });
+                let event = {
+                    let state = uc.get_data_mut();
+                    let event = state.write_register(address, access_size, value);
+                    state.record_mmio(MmioAccess {
+                        write: true,
+                        address,
+                        size: access_size,
+                        value,
+                        pc,
+                    });
+                    event
+                };
+                if std::env::var_os("E830_TRACE_DSP_TX").is_some()
+                    && address == DSP_CONTROL_BASE as u32 + 8
+                    && matches!(value as u16, 0x1001 | 0x1002 | 0x2001 | 0x4001)
+                {
+                    let mailbox = uc.mem_read_as_vec(DSP_MAILBOX_BASE, 0x90).unwrap_or_default();
+                    let halfword = |offset: usize| -> u16 {
+                        mailbox.get(offset..offset + 2)
+                            .and_then(|slice| slice.try_into().ok())
+                            .map(u16::from_le_bytes)
+                            .unwrap_or(0)
+                    };
+                    eprintln!(
+                        "[e830-dsp-mailbox] pc=0x{pc:08x} tx=0x{:04x} m14=0x{:04x} m7c=0x{:04x} m7e=0x{:04x} m80=0x{:04x} m82=0x{:04x}",
+                        value as u16,
+                        halfword(0x14),
+                        halfword(0x7c),
+                        halfword(0x7e),
+                        halfword(0x80),
+                        halfword(0x82),
+                    );
+                }
+                if event == Some(DspEvent::StartupReady) {
+                    let _ = uc.mem_write(
+                        DSP_SHARED_RAM_BASE,
+                        &E830_DSP_STARTUP_MAGIC.to_le_bytes(),
+                    );
+                }
             },
         ),
     )
@@ -1458,8 +1835,111 @@ fn install_tcm_hooks(cpu: &mut Unicorn<'static, E830State>, image: &[u8]) -> Res
     Ok(())
 }
 
+fn handle_internal_flash_command_write(
+    uc: &mut Unicorn<'_, E830State>,
+    pc: u64,
+) -> bool {
+    let (address_register, value_register, expected_address, expected_value) = match pc {
+        0x31f0_0034 | 0x2189_a528 | 0x0189_a528 | 0xeb89_a528 => {
+            (RegisterARM::R3, RegisterARM::R1, 0x2000_0aaau32, 0x00aau16)
+        }
+        0x31f0_0038 | 0x2189_a52c | 0x0189_a52c | 0xeb89_a52c => {
+            (RegisterARM::R1, RegisterARM::R2, 0x2000_0554u32, 0x0055u16)
+        }
+        0x31f0_003c | 0x2189_a530 | 0x0189_a530 | 0xeb89_a530 => {
+            (RegisterARM::R1, RegisterARM::R0, 0x2008_2aaau32, 0x00c0u16)
+        }
+        _ => return false,
+    };
+    let target = uc.reg_read(address_register).unwrap_or(u64::MAX) as u32;
+    let value = uc.reg_read(value_register).unwrap_or(u64::MAX) as u16;
+    if target != expected_address || value != expected_value {
+        return false;
+    }
+    if std::env::var_os("E830_TRACE_FLASH_COMMANDS").is_some() {
+        eprintln!(
+            "[e830-flash-command] pc=0x{pc:08x} address=0x{target:08x} value=0x{value:04x}"
+        );
+    }
+    // These are AMD-style command cycles to the internal firmware flash, not
+    // array programming.  Keep the immutable CLA bytes intact and consume the
+    // store just as the external NOR command model consumes unlock commands.
+    // Unicorn derives Thumb state from bit 0 on a PC write.  Resume at the
+    // following halfword while keeping the copied RAM routine in Thumb mode.
+    uc.reg_write(RegisterARM::PC, pc + 3).is_ok()
+}
+
 fn install_hooks(cpu: &mut Unicorn<'static, E830State>) -> Result<(), MachineError> {
     cpu.add_code_hook(0, u64::MAX, |uc, address, _| {
+        if address == DSP_ASYNC_TRAMPOLINE {
+            let phase = uc.get_data().dsp_queue_hle_phase;
+            let completed_head = uc.get_data().dsp_queue_head;
+            let context = uc.get_data_mut().dsp_completion_context.take();
+            let resume_pc = context
+                .as_ref()
+                .and_then(|context| context.reg_read(RegisterARM::PC).ok());
+            let resume_cpsr = context
+                .as_ref()
+                .and_then(|context| context.reg_read(RegisterARM::CPSR).ok());
+            let restored = context
+                .as_ref()
+                .is_some_and(|context| uc.context_restore(context).is_ok());
+            let total = uc.get_data().instructions
+                .saturating_add(uc.get_data().fast_forwarded_instructions);
+            if !restored {
+                uc.get_data_mut().dsp_queue_hle_phase = DspQueueHlePhase::Idle;
+                return;
+            }
+            match phase {
+                DspQueueHlePhase::StartRunning => {
+                    uc.get_data_mut().dsp_queue_hle_phase = DspQueueHlePhase::CompletePending {
+                        deadline: total.saturating_add(DSP_ASYNC_COMPLETE_DELAY),
+                    };
+                }
+                DspQueueHlePhase::CompleteRunning => {
+                    let next_head = uc
+                        .mem_read_as_vec(u64::from(DSP_ASYNC_QUEUE + 4), 4)
+                        .ok()
+                        .and_then(|bytes| bytes.try_into().ok())
+                        .map(u32::from_le_bytes)
+                        .unwrap_or(0);
+                    let next_callback = if next_head != 0 {
+                        uc.mem_read_as_vec(u64::from(next_head + 0x10), 4)
+                            .ok()
+                            .and_then(|bytes| bytes.try_into().ok())
+                            .map(u32::from_le_bytes)
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    let state = uc.get_data_mut();
+                    if next_head != 0
+                        && next_head != completed_head
+                        && next_callback == DSP_ASYNC_CALLBACK
+                    {
+                        state.dsp_queue_head = next_head;
+                        state.dsp_queue_hle_phase = DspQueueHlePhase::CompletePending {
+                            deadline: total.saturating_add(DSP_ASYNC_COMPLETE_DELAY),
+                        };
+                    } else {
+                        state.dsp_queue_head = 0;
+                        state.dsp_queue_hle_phase = DspQueueHlePhase::Idle;
+                    }
+                }
+                _ => {
+                    uc.get_data_mut().dsp_queue_hle_phase = DspQueueHlePhase::Idle;
+                }
+            }
+            if let (Some(resume_pc), Some(resume_cpsr)) = (resume_pc, resume_cpsr) {
+                let _ = uc.reg_write(RegisterARM::CPSR, resume_cpsr);
+                let _ = uc.reg_write(
+                    RegisterARM::PC,
+                    resume_pc | ((resume_cpsr >> 5) & 1),
+                );
+            }
+            return;
+        }
+
         let (
             is_delay_loop,
             is_nested_delay_loop,
@@ -1506,7 +1986,107 @@ fn install_hooks(cpu: &mut Unicorn<'static, E830State>) -> Result<(), MachineErr
             return;
         }
 
+        if handle_internal_flash_command_write(uc, address) {
+            return;
+        }
+
         let total = uc.get_data().instructions.saturating_add(uc.get_data().fast_forwarded_instructions);
+        if address == DSP_ASYNC_EVENT_HANDLER_PC
+            && uc.get_data().dsp_boot.runtime_hle_active()
+            && uc.get_data().dsp_queue_hle_phase == DspQueueHlePhase::Idle
+            && uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32 == DSP_ASYNC_QUEUE
+            && uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32 == 1
+        {
+            let head = uc
+                .mem_read_as_vec(u64::from(DSP_ASYNC_QUEUE + 4), 4)
+                .ok()
+                .and_then(|bytes| bytes.try_into().ok())
+                .map(u32::from_le_bytes)
+                .unwrap_or(0);
+            let callback = if head != 0 {
+                uc.mem_read_as_vec(u64::from(head + 0x10), 4)
+                    .ok()
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .map(u32::from_le_bytes)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            if head != 0 && callback == DSP_ASYNC_CALLBACK {
+                let state = uc.get_data_mut();
+                state.dsp_queue_head = head;
+                state.dsp_queue_hle_phase = DspQueueHlePhase::StartPending {
+                    deadline: total.saturating_add(DSP_ASYNC_START_DELAY),
+                };
+            }
+        }
+
+        let due_phase = match uc.get_data().dsp_queue_hle_phase {
+            DspQueueHlePhase::StartPending { deadline } if total >= deadline => Some(false),
+            DspQueueHlePhase::CompletePending { deadline } if total >= deadline => Some(true),
+            _ => None,
+        };
+        if let Some(completing) = due_phase {
+            let head = uc
+                .mem_read_as_vec(u64::from(DSP_ASYNC_QUEUE + 4), 4)
+                .ok()
+                .and_then(|bytes| bytes.try_into().ok())
+                .map(u32::from_le_bytes)
+                .unwrap_or(0);
+            let callback = if head != 0 {
+                uc.mem_read_as_vec(u64::from(head + 0x10), 4)
+                    .ok()
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .map(u32::from_le_bytes)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            if head != 0 && callback == DSP_ASYNC_CALLBACK {
+                if let Ok(context) = uc.context_init() {
+                    {
+                        let state = uc.get_data_mut();
+                        state.dsp_completion_context = Some(context);
+                        state.dsp_queue_head = head;
+                        state.dsp_queue_hle_phase = if completing {
+                            DspQueueHlePhase::CompleteRunning
+                        } else {
+                            DspQueueHlePhase::StartRunning
+                        };
+                    }
+                    if std::env::var_os("E830_TRACE_DSP_TX").is_some() {
+                        let operation = if completing { "complete" } else { "start" };
+                        eprintln!(
+                            "[e830-dsp-queue] {operation} head=0x{head:08x} queue=0x{DSP_ASYNC_QUEUE:08x} insns={total}"
+                        );
+                    }
+                    let cpsr = uc.reg_read(RegisterARM::CPSR).unwrap_or(0) as u32;
+                    let _ = uc.reg_write(RegisterARM::R0, u64::from(if completing {
+                        head
+                    } else {
+                        DSP_ASYNC_QUEUE
+                    }));
+                    let _ = uc.reg_write(RegisterARM::R1, u64::from(if completing {
+                        DSP_ASYNC_QUEUE
+                    } else {
+                        2
+                    }));
+                    let _ = uc.reg_write(RegisterARM::LR, DSP_ASYNC_TRAMPOLINE | 1);
+                    let _ = uc.reg_write(RegisterARM::CPSR, u64::from(cpsr | CPSR_THUMB));
+                    let _ = uc.reg_write(RegisterARM::PC, u64::from(if completing {
+                        DSP_ASYNC_COMPLETE
+                    } else {
+                        DSP_ASYNC_EVENT_HANDLER
+                    }));
+                    return;
+                }
+            } else {
+                let state = uc.get_data_mut();
+                state.dsp_queue_head = 0;
+                state.dsp_queue_hle_phase = DspQueueHlePhase::Idle;
+            }
+        }
+
         if let Some(limit) = uc.get_data().trace_sp_below {
             let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
             let (last_sp, last_pc, after, remaining) = {
@@ -1613,9 +2193,11 @@ fn install_hooks(cpu: &mut Unicorn<'static, E830State>) -> Result<(), MachineErr
                 let state = uc.get_data();
                 let mask = state.registers.get(&INTC_ENABLE_MASK_REGISTER).copied().unwrap_or(u32::MAX);
                 let control = state.registers.get(&(SOC_TIMER + 8)).copied().unwrap_or(0);
-                let compare = state.registers.get(&(SOC_TIMER + 0x0c)).copied().unwrap_or(0);
+                let period = state.registers.get(&(SOC_TIMER + 0x0c)).copied().unwrap_or(0);
+                let match0 = state.registers.get(&(SOC_TIMER + 0x10)).copied().unwrap_or(0);
+                let match1 = state.registers.get(&(SOC_TIMER + 0x14)).copied().unwrap_or(0);
                 uc.get_data_mut().trace_timer_line(format!(
-                    "pc=0x{address:08x} r0=0x{r0:08x} r1=0x{r1:08x} sp=0x{sp:08x} lr=0x{lr:08x} cpsr=0x{cpsr:08x} mask=0x{mask:08x} ctrl=0x{control:08x} cmp0=0x{compare:08x} insns={total}"
+                    "pc=0x{address:08x} r0=0x{r0:08x} r1=0x{r1:08x} sp=0x{sp:08x} lr=0x{lr:08x} cpsr=0x{cpsr:08x} mask=0x{mask:08x} ctrl=0x{control:08x} period=0x{period:08x} match0=0x{match0:08x} match1=0x{match1:08x} insns={total}"
                 ));
             }
         }
@@ -1655,6 +2237,23 @@ fn install_hooks(cpu: &mut Unicorn<'static, E830State>) -> Result<(), MachineErr
         }
 
         // Advance device time even while the CPU masks interrupts.
+        let service_cpsr = uc.reg_read(RegisterARM::CPSR).unwrap_or(0) as u32;
+        let service_nesting = uc
+            .mem_read_as_vec(RTOS_NESTING_DEPTH, 1)
+            .ok()
+            .and_then(|bytes| bytes.first().copied())
+            .unwrap_or(u8::MAX);
+        if interrupt_service_returned(
+            service_cpsr,
+            uc.get_data().timer_irq_in_service,
+            uc.get_data().irq_eoi_seen,
+            service_nesting,
+            uc.get_data().irq_entry_nesting,
+        ) {
+            let state = uc.get_data_mut();
+            state.timer_irq_in_service = false;
+            state.irq_eoi_seen = false;
+        }
         let irq_is_pending = {
             let state = uc.get_data_mut();
             let total = state.instructions.saturating_add(state.fast_forwarded_instructions);
@@ -1685,13 +2284,11 @@ fn install_hooks(cpu: &mut Unicorn<'static, E830State>) -> Result<(), MachineErr
         };
         if irq_is_pending {
             let cpsr = uc.reg_read(RegisterARM::CPSR).unwrap_or(0) as u32;
-            let irqs_enabled = cpsr & CPSR_IRQ_DISABLE == 0;
-            let already_in_irq = cpsr & CPSR_MODE_MASK == CPSR_MODE_IRQ;
             let in_service = uc.get_data().timer_irq_in_service;
             let pending = uc.get_data().enabled_pending_lines();
             let line_enabled = pending != 0;
             let line = 31 - pending.leading_zeros();
-            if irqs_enabled && line_enabled && !already_in_irq && !in_service {
+            if line_enabled && interrupt_delivery_allowed(cpsr, in_service) {
                 // ARM IRQ entry: the return address is the instruction we were
                 // about to run, recovered by the handler's `sub lr,lr,#4` from
                 // lr = address + 4. Switch to IRQ mode first so the banked LR
@@ -1710,6 +2307,8 @@ fn install_hooks(cpu: &mut Unicorn<'static, E830State>) -> Result<(), MachineErr
                     state.irqs_taken = state.irqs_taken.saturating_add(1);
                     state.active_irq_line = line;
                     state.timer_irq_in_service = true;
+                    state.irq_eoi_seen = false;
+                    state.irq_entry_nesting = service_nesting;
                     return;
                 }
             }
@@ -1959,6 +2558,30 @@ fn install_hooks(cpu: &mut Unicorn<'static, E830State>) -> Result<(), MachineErr
     )
     .map_err(|error| unicorn_error("installing the RTOS-nesting trace", error))?;
 
+    if let Some(start) = env_u64("E830_TRACE_RAM_START") {
+        let end = env_u64("E830_TRACE_RAM_END").unwrap_or(start);
+        let after = env_u64("E830_TRACE_RAM_AFTER").unwrap_or(0);
+        let mut remaining = env_u64("E830_TRACE_RAM_LIMIT").unwrap_or(1000);
+        cpu.add_mem_hook(
+            HookType::MEM_WRITE,
+            start.min(end),
+            start.max(end),
+            move |uc, _, address, size, value| {
+                let total = uc.get_data().instructions
+                    .saturating_add(uc.get_data().fast_forwarded_instructions);
+                if total >= after && remaining > 0 {
+                    let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                    eprintln!(
+                        "[e830-ram] write addr=0x{address:08x} size={size} value=0x{value:08x} pc=0x{pc:08x} insns={total}"
+                    );
+                    remaining -= 1;
+                }
+                false
+            },
+        )
+        .map_err(|error| unicorn_error("installing the focused RAM trace", error))?;
+    }
+
     cpu.add_mem_hook(
         HookType::MEM_INVALID,
         0,
@@ -2010,12 +2633,31 @@ mod tests {
     use super::{
         fast_forward_counting_delay, fast_forward_nested_delay, find_counting_delay_loop_pcs,
         find_fade_delay_loop_pcs, find_nested_delay_loop_pcs, DspBootInterface, E830Machine, E830State,
+        interrupt_delivery_allowed, interrupt_service_returned,
         COUNTING_DELAY_LOOP, FADE_DELAY_LOOP,
         E830_TFS_SOURCE_BASE, FLASH_BASE,
         NESTED_DELAY_LOOP, SOC_BOOT_READY_INPUT_MASK, SOC_BOOT_READY_INPUT_REGISTER,
-        SOC_INIT_CONTROL_REGISTER, SOC_KEYPAD_INPUT_REGISTERS, SOC_KEYPAD_SCAN_READ_PCS, SOC_TIMER,
-        SYSTEM_TIMER_IRQ,
+        SOC_INIT_CONTROL_REGISTER, SOC_KEYPAD_INPUT_REGISTERS, SOC_KEYPAD_SCAN_READ_PCS,
+        SOC_TIMER,
+        SYSTEM_TIMER_CPU_CLOCK_RATIO, SYSTEM_TIMER_IRQ, SYSTEM_TIMER_IRQ20_ENABLE,
+        SYSTEM_TIMER_IRQ20_STATUS, SYSTEM_TIMER_IRQ21_ENABLE, SYSTEM_TIMER_IRQ21_STATUS,
+        SYSTEM_TIMER_MATCH0_ENABLE, SYSTEM_TIMER_MATCH1_ENABLE, SYSTEM_TIMER_MATCH_IRQ,
     };
+
+    #[test]
+    fn interrupt_delivery_waits_for_outer_vector_completion() {
+        assert!(interrupt_delivery_allowed(0x1f, false));
+        assert!(!interrupt_delivery_allowed(0x9f, false));
+        assert!(!interrupt_delivery_allowed(0x12, false));
+        assert!(!interrupt_delivery_allowed(0x1f, true));
+
+        assert!(!interrupt_service_returned(0x1f, true, false, 0, 0));
+        assert!(!interrupt_service_returned(0x9f, true, true, 0, 0));
+        assert!(!interrupt_service_returned(0x12, true, true, 0, 0));
+        assert!(!interrupt_service_returned(0x1f, true, true, 2, 1));
+        assert!(interrupt_service_returned(0x1f, true, true, 1, 1));
+        assert!(interrupt_service_returned(0x1f, true, true, 0, 1));
+    }
 
     #[test]
     fn dsp_boot_signature_sets_and_clears_rx_ready() {
@@ -2066,6 +2708,17 @@ mod tests {
     }
 
     #[test]
+    fn dsp_memory_snapshot_preserves_word_addresses_and_zero_fills_holes() {
+        let mut dsp = DspBootInterface::default();
+        dsp.memories[0].insert(0, 0x1234);
+        dsp.memories[0].insert(2, 0xabcd);
+        let bytes = dsp.memory_snapshot(0).unwrap();
+        assert_eq!(&bytes[..6], &[0x34, 0x12, 0, 0, 0xcd, 0xab]);
+        assert_eq!(bytes.len(), 0x20_000);
+        assert!(dsp.memory_snapshot(2).is_none());
+    }
+
+    #[test]
     fn dsp_control_keeps_firmware_bits_while_status_is_device_owned() {
         let mut dsp = DspBootInterface::default();
         dsp.write(super::DSP_CONTROL_BASE as u32, 4, 0x0048);
@@ -2089,6 +2742,61 @@ mod tests {
 
         assert_eq!(dsp.status() & DspBootInterface::RX_READY, 0);
         assert_eq!(dsp.read(super::DSP_CONTROL_BASE as u32 + 4, 2), 0);
+    }
+
+    #[test]
+    fn diagnostic_dsp_runtime_hle_requires_recognized_running_phase() {
+        let mut disabled = DspBootInterface::new(false);
+        disabled.parser = super::DspBootParser::Running;
+        assert_eq!(disabled.transmit(0x4001), None);
+
+        let mut recognized = DspBootInterface::new(true);
+        recognized.parser = super::DspBootParser::Running;
+        recognized.hle_phase = super::DspHlePhase::E830Running;
+        assert_eq!(recognized.transmit(0x4001), Some(super::DspEvent::RuntimeReady));
+        assert_eq!(recognized.hle_phase, super::DspHlePhase::E830RuntimeReady);
+        assert_eq!(recognized.transmit(0x1001), Some(super::DspEvent::RuntimeReady));
+        assert!(recognized.runtime_signal_acknowledged());
+        assert!(!recognized.runtime_signal_acknowledged());
+        assert_eq!(recognized.transmit(0x1002), Some(super::DspEvent::RuntimeReady));
+        assert!(!recognized.runtime_signal_acknowledged());
+        assert_eq!(recognized.transmit(0x2001), Some(super::DspEvent::RuntimeReady));
+        assert!(!recognized.runtime_signal_acknowledged());
+        assert_eq!(recognized.transmit(0x4001), Some(super::DspEvent::RuntimeReady));
+    }
+
+    #[test]
+    fn diagnostic_dsp_runtime_readback_returns_uploaded_words_and_resumes_runtime() {
+        let mut dsp = DspBootInterface::new(true);
+        dsp.hle_phase = super::DspHlePhase::E830Running;
+        dsp.parser = super::DspBootParser::Running;
+        dsp.memories[1].insert(0x7800, 0x1234);
+        dsp.memories[1].insert(0x7801, 0xabcd);
+
+        for word in [0x0006, 0x7800, 0x0002] {
+            assert_eq!(dsp.transmit(word), None);
+        }
+        assert_eq!(dsp.read(super::DSP_CONTROL_BASE as u32 + 4, 2), 0x1234);
+        assert_eq!(dsp.read(super::DSP_CONTROL_BASE as u32 + 4, 2), 0xabcd);
+        assert_eq!(dsp.parser, super::DspBootParser::Running);
+        assert_eq!(dsp.transmit(0x4001), Some(super::DspEvent::RuntimeReady));
+    }
+
+    #[test]
+    fn dsp_signal_acknowledgement_clears_only_written_zero_bits() {
+        let mut state = E830State::new(
+            false,
+            vec![0xff; super::EXTERNAL_FLASH_WINDOW_SIZE as usize],
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        );
+        state.registers.insert(super::DSP_START_SIGNAL, 0x0003);
+        state.write_register(super::DSP_START_SIGNAL, 2, 0xfffe);
+        assert_eq!(state.read_register(super::DSP_START_SIGNAL, 2, 0), 0x0002);
+        state.write_register(super::DSP_START_SIGNAL, 2, 0);
+        assert_eq!(state.read_register(super::DSP_START_SIGNAL, 2, 0), 0);
     }
 
     #[test]
@@ -2148,10 +2856,10 @@ mod tests {
             Default::default(),
             Default::default(),
         );
-        state.advance_system_timer(123);
+        state.advance_system_timer(123 * SYSTEM_TIMER_CPU_CLOCK_RATIO);
         assert_eq!(state.read_register(SOC_TIMER, 2, 0), 123);
         assert_eq!(state.read_register(SOC_TIMER, 2, 0), 123);
-        state.advance_system_timer(130);
+        state.advance_system_timer(130 * SYSTEM_TIMER_CPU_CLOCK_RATIO);
         assert_eq!(state.read_register(SOC_TIMER, 2, 0), 130);
     }
 
@@ -2167,14 +2875,14 @@ mod tests {
         );
         state.write_register(SOC_TIMER + 8, 2, 0x20);
         state.timer_counter = 0xfffe;
-        state.advance_system_timer(2);
+        state.advance_system_timer(2 * SYSTEM_TIMER_CPU_CLOCK_RATIO);
         assert_eq!(state.read_register(SOC_TIMER, 2, 0), 0);
         assert_ne!(state.read_register(SOC_TIMER + 8, 2, 0) & 0x80, 0);
         assert_ne!(state.pending_lines() & (1 << SYSTEM_TIMER_IRQ), 0);
     }
 
     #[test]
-    fn system_timer_wrap_latches_programmed_period() {
+    fn system_timer_wrap_preserves_compare_registers_without_match_mode() {
         let mut state = E830State::new(
             false,
             vec![0xff; 0x1000],
@@ -2183,15 +2891,130 @@ mod tests {
             Default::default(),
             Default::default(),
         );
-        state.write_register(SOC_TIMER + 8, 2, 0x40);
+        state.write_register(
+            SOC_TIMER + 8,
+            2,
+            u64::from(SYSTEM_TIMER_IRQ20_ENABLE),
+        );
         state.write_register(SOC_TIMER + 0x0c, 2, 5000);
         state.write_register(SOC_TIMER + 0x14, 2, 4700);
         state.timer_counter = 0xfffe;
 
-        state.advance_system_timer(1);
+        state.advance_system_timer(SYSTEM_TIMER_CPU_CLOCK_RATIO);
         assert_eq!(state.read_register(SOC_TIMER + 0x0c, 2, 0), 5000);
-        state.advance_system_timer(2);
-        assert_eq!(state.read_register(SOC_TIMER + 0x0c, 2, 0), 4700);
+        state.advance_system_timer(2 * SYSTEM_TIMER_CPU_CLOCK_RATIO);
+        assert_eq!(state.read_register(SOC_TIMER + 0x0c, 2, 0), 5000);
+        assert_eq!(state.read_register(SOC_TIMER + 0x14, 2, 0), 4700);
+    }
+
+    #[test]
+    fn system_timer_status_bits_are_write_zero_to_clear() {
+        let mut state = E830State::new(
+            false,
+            vec![0xff; 0x1000],
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        );
+        state.registers.insert(
+            SOC_TIMER + 8,
+            SYSTEM_TIMER_MATCH0_ENABLE
+                | SYSTEM_TIMER_MATCH1_ENABLE
+                | SYSTEM_TIMER_IRQ20_ENABLE
+                | SYSTEM_TIMER_IRQ21_ENABLE
+                | SYSTEM_TIMER_IRQ20_STATUS
+                | SYSTEM_TIMER_IRQ21_STATUS,
+        );
+        state.system_timer_irq_pending = true;
+        state.system_timer_match_irq_pending = true;
+
+        state.write_register(SOC_TIMER + 8, 2, 0x0760);
+        assert_eq!(state.read_register(SOC_TIMER + 8, 2, 0), 0x0760);
+        assert_eq!(state.pending_lines() & (1 << SYSTEM_TIMER_IRQ), 0);
+        assert_ne!(state.pending_lines() & (1 << SYSTEM_TIMER_MATCH_IRQ), 0);
+
+        state.write_register(SOC_TIMER + 8, 2, 0x06e0);
+        assert_eq!(state.read_register(SOC_TIMER + 8, 2, 0), 0x0660);
+        assert_eq!(state.pending_lines() & (1 << SYSTEM_TIMER_MATCH_IRQ), 0);
+    }
+
+    #[test]
+    fn periodic_mode_write_preserves_but_does_not_create_timer_status() {
+        let mut state = E830State::new(
+            false,
+            vec![0xff; 0x1000],
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        );
+        state.write_register(SOC_TIMER + 8, 2, 0x07e0);
+        assert_eq!(state.read_register(SOC_TIMER + 8, 2, 0), 0x0660);
+        assert_eq!(state.pending_lines() & (1 << SYSTEM_TIMER_IRQ), 0);
+        assert_eq!(state.pending_lines() & (1 << SYSTEM_TIMER_MATCH_IRQ), 0);
+
+        state.registers.insert(SOC_TIMER + 8, 0x0760);
+        state.system_timer_match_irq_pending = true;
+        state.write_register(SOC_TIMER + 8, 2, 0x07e0);
+        assert_eq!(state.read_register(SOC_TIMER + 8, 2, 0), 0x0760);
+        assert_ne!(state.pending_lines() & (1 << SYSTEM_TIMER_MATCH_IRQ), 0);
+    }
+
+    #[test]
+    fn irq21_enable_without_match1_enable_does_not_compare() {
+        let mut state = E830State::new(
+            false,
+            vec![0xff; 0x1000],
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        );
+        state.write_register(SOC_TIMER + 8, 2, u64::from(SYSTEM_TIMER_IRQ21_ENABLE));
+        state.write_register(SOC_TIMER + 0x0c, 2, 5000);
+        state.write_register(SOC_TIMER + 0x14, 2, 4700);
+        state.timer_counter = 4699;
+
+        state.advance_system_timer(SYSTEM_TIMER_CPU_CLOCK_RATIO);
+        assert_eq!(state.read_register(SOC_TIMER, 2, 0), 4700);
+        assert_eq!(state.pending_lines() & (1 << SYSTEM_TIMER_MATCH_IRQ), 0);
+    }
+
+    #[test]
+    fn observed_periodic_mode_raises_early_match_then_resets_at_period() {
+        let mut state = E830State::new(
+            false,
+            vec![0xff; 0x1000],
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+        );
+        state.write_register(
+            SOC_TIMER + 8,
+            2,
+            u64::from(
+                SYSTEM_TIMER_MATCH0_ENABLE
+                    | SYSTEM_TIMER_MATCH1_ENABLE
+                    | SYSTEM_TIMER_IRQ20_ENABLE
+                    | SYSTEM_TIMER_IRQ21_ENABLE,
+            ),
+        );
+        state.write_register(SOC_TIMER + 0x0c, 2, 5000);
+        state.write_register(SOC_TIMER + 0x14, 2, 4700);
+        state.timer_counter = 586;
+
+        state.advance_system_timer(4114 * SYSTEM_TIMER_CPU_CLOCK_RATIO);
+        assert_eq!(state.read_register(SOC_TIMER, 2, 0), 4700);
+        assert_eq!(state.pending_lines() & (1 << SYSTEM_TIMER_IRQ), 0);
+        assert_ne!(state.pending_lines() & (1 << SYSTEM_TIMER_MATCH_IRQ), 0);
+
+        state.write_register(SOC_TIMER + 8, 2, 0x06e0);
+        state.advance_system_timer((4114 + 300) * SYSTEM_TIMER_CPU_CLOCK_RATIO);
+        assert_eq!(state.read_register(SOC_TIMER, 2, 0), 0);
+        assert_ne!(state.pending_lines() & (1 << SYSTEM_TIMER_IRQ), 0);
+        assert_eq!(state.pending_lines() & (1 << SYSTEM_TIMER_MATCH_IRQ), 0);
     }
 
     #[test]
@@ -2206,11 +3029,13 @@ mod tests {
         );
         state.write_register(SOC_TIMER + 8, 2, 0x20);
         state.timer_counter = 0xffff;
-        state.advance_system_timer(1);
+        state.advance_system_timer(SYSTEM_TIMER_CPU_CLOCK_RATIO);
         state.active_irq_line = SYSTEM_TIMER_IRQ;
         state.timer_irq_in_service = true;
 
         state.write_register(SOC_INIT_CONTROL_REGISTER, 1, 0x80);
+        assert!(state.timer_irq_in_service);
+        assert!(state.irq_eoi_seen);
         assert_ne!(state.pending_lines() & (1 << SYSTEM_TIMER_IRQ), 0);
 
         state.write_register(SOC_TIMER + 8, 2, 0x120);
@@ -2296,6 +3121,35 @@ mod tests {
             second.instructions
         );
         assert!(second.instructions > first.instructions);
+    }
+
+    #[test]
+    fn cla_working_image_writes_do_not_change_the_read_only_mirror() {
+        let mut cla = vec![0xff; 0x20_000];
+        cla[..4].copy_from_slice(&[0x54, 0xf1, 0x9f, 0xe5]);
+        cla[0x15c..0x160].copy_from_slice(&(FLASH_BASE + 0x100).to_le_bytes());
+        let words = [
+            0xe59f_0008u32, // ldr r0, [pc, #8]
+            0xe3a0_1005,    // mov r1, #5
+            0xe580_1000,    // str r1, [r0]
+            0xeaff_fffe,    // b .
+            FLASH_BASE + 0x180,
+        ];
+        for (index, word) in words.into_iter().enumerate() {
+            cla[0x100 + index * 4..0x104 + index * 4].copy_from_slice(&word.to_le_bytes());
+        }
+        let firmware = crate::FirmwareSet::from_bytes(cla, vec![1], None, None).unwrap();
+        let mut machine = E830Machine::new(firmware, false).unwrap();
+
+        let report = machine.run(4).unwrap();
+        assert!(report.memory_fault.is_none());
+        assert_eq!(machine.peek_u32(FLASH_BASE + 0x180), Some(5));
+        let mirror = machine
+            .cpu
+            .raw_engine()
+            .mem_read_as_vec(super::E830_BOOT_ROM_MIRROR_BASE + 0x180, 4)
+            .unwrap();
+        assert_eq!(mirror, vec![0xff; 4]);
     }
 
     #[test]

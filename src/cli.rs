@@ -49,6 +49,12 @@ struct Args {
     /// Save bytes transmitted by the first UART (boot/download serial port)
     #[arg(long)]
     dump_uart: Option<PathBuf>,
+    /// Save DSP boot memory space 0 as little-endian 16-bit words
+    #[arg(long)]
+    dump_dsp_space0: Option<PathBuf>,
+    /// Save DSP boot memory space 1 as little-endian 16-bit words
+    #[arg(long)]
+    dump_dsp_space1: Option<PathBuf>,
 }
 
 fn parse_address(raw: &str) -> Result<u32, String> {
@@ -86,6 +92,13 @@ fn main() -> Result<()> {
     if let Some(path) = args.dump_ram {
         std::fs::write(&path, machine.sdram_snapshot()?).context("saving diagnostic SDRAM capture")?;
         println!("SDRAM saved: {}", path.display());
+    }
+    for (space, path) in [(0, args.dump_dsp_space0), (1, args.dump_dsp_space1)] {
+        if let Some(path) = path {
+            let bytes = machine.dsp_memory_snapshot(space).context("reading DSP boot memory")?;
+            std::fs::write(&path, bytes).context("saving DSP boot memory")?;
+            println!("DSP space {space} saved: {}", path.display());
+        }
     }
     for address in args.peek {
         println!("peek 0x{address:08x}: {:?}", machine.peek_u32(address));

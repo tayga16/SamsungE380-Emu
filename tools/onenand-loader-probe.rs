@@ -58,6 +58,10 @@ struct Args {
     /// Binary stream of the examined loader's original serial protocol.
     #[arg(long)]
     serial_input: Option<PathBuf>,
+    /// Exact UART response expected from the examined loader. A mismatch
+    /// aborts before any requested NAND output is created.
+    #[arg(long)]
+    expected_serial_output: Option<PathBuf>,
     #[arg(long, default_value_t = 30_000_000)]
     max_instructions: usize,
     #[arg(long)]
@@ -86,9 +90,13 @@ struct Args {
     #[arg(long)]
     import_stl: Option<PathBuf>,
     /// Call the original FAT formatter with an explicit cluster size at its E0 entry.
-    /// Requires --break-at 0x3000b170; only the formatter's public argument changes.
+    /// Only the formatter's public fourth argument changes.
     #[arg(long)]
     format_fat_cluster_sectors: Option<u32>,
+    /// Select one of the examined loader's built-in flash/partition profiles
+    /// immediately before E0 formatting. The Clifford 32 MiB profile is 1.
+    #[arg(long)]
+    loader_profile_index: Option<u32>,
 }
 
 fn parse_address(value: &str) -> Result<u64, String> {
@@ -294,6 +302,22 @@ fn main() -> Result<()> {
             }
         })?;
     }
+    if let Some(index) = args.loader_profile_index {
+        if profile.ram != 0x30000000 || index > 3 {
+            bail!("loader profile selection requires the examined Clifford VE profile and index 0..3");
+        }
+        cpu.add_code_hook(0x30007344, 0x30007344, move |uc, _, _| {
+            let _ = uc.mem_write(0x300a15d8, &index.to_le_bytes());
+        })?;
+    }
+    if let Some(sectors) = args.format_fat_cluster_sectors {
+        if profile.ram != 0x30000000 || !matches!(sectors, 1 | 2 | 4 | 8 | 16 | 32 | 64) {
+            bail!("explicit FAT cluster size requires the examined Clifford VE profile and a power-of-two value from 1 through 64");
+        }
+        cpu.add_code_hook(0x3000b170, 0x3000b170, move |uc, _, _| {
+            let _ = uc.reg_write(RegisterARM::R3, u64::from(sectors));
+        })?;
+    }
     cpu.add_mem_hook(HookType::MEM_INVALID, 0, u64::MAX, |uc, kind, address, size, value| {
         println!("memory fault {kind:?} address=0x{address:08x} size={size} value=0x{value:x}");
         uc.get_data_mut().stop = Some("memory_fault");
@@ -306,19 +330,6 @@ fn main() -> Result<()> {
     cpu.reg_write(RegisterARM::SP, profile.stack)?;
     let result = cpu.emu_start(profile.ram + 4, u64::MAX, 0, args.max_instructions);
     result.map_err(|error| anyhow::anyhow!("loader execution stopped with {error:?}"))?;
-    if let Some(sectors) = args.format_fat_cluster_sectors {
-        if profile.ram != 0x30000000 || cpu.get_data().stop != Some("breakpoint")
-            || cpu.reg_read(RegisterARM::PC)? != 0x3000b170
-            || !matches!(sectors, 1 | 2 | 4 | 8 | 16 | 32 | 64) {
-            bail!("explicit FAT cluster size requires examined original E0 formatter entry");
-        }
-        let call_args = [cpu.reg_read(RegisterARM::R0)? as u32,
-            cpu.reg_read(RegisterARM::R1)? as u32,
-            cpu.reg_read(RegisterARM::R2)? as u32, sectors];
-        let formatted = guest_call(&mut cpu, &profile, 0x3001e069, &call_args)?;
-        if formatted != 0 { bail!("original FAT formatter returned 0x{formatted:08x}"); }
-        println!("original FAT formatter completed with {sectors} sectors per cluster");
-    }
     if args.export_stl.is_some() || args.import_stl.is_some() {
         transfer_stl(&mut cpu, &profile, args.import_stl, args.export_stl)?;
     }
@@ -326,6 +337,18 @@ fn main() -> Result<()> {
     let r0 = cpu.reg_read(RegisterARM::R0)?;
     let r1 = cpu.reg_read(RegisterARM::R1)?;
     let state = cpu.get_data();
+    if let Some(path) = args.expected_serial_output {
+        let expected = std::fs::read(&path)
+            .with_context(|| format!("reading expected UART response {}", path.display()))?;
+        if state.uart.output() != expected {
+            bail!("loader UART response differs: got {} bytes, expected {} bytes",
+                state.uart.output().len(), expected.len());
+        }
+        if !state.input.is_empty() || state.stop != Some("waiting_for_serial_input") {
+            bail!("loader did not consume the complete serial stream cleanly");
+        }
+        println!("loader UART response verified: {} bytes", expected.len());
+    }
     let report = serde_json::json!({"profile": profile.name, "execution": format!("{result:?}"), "pc": pc, "r0": r0, "r1": r1,
         "stop": state.stop.unwrap_or("instruction_budget"), "serial_remaining": state.input.len(),
         "serial_output_hex": state.uart.output().iter().map(|byte| format!("{byte:02x}")).collect::<String>(),

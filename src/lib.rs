@@ -218,6 +218,7 @@ mod tests {
 mod cpu;
 mod uart;
 mod i2c;
+mod serial;
 mod onenand;
 
 mod nor;

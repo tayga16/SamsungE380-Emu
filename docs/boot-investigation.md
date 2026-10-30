@@ -1,6 +1,6 @@
 ﻿# E830: current native Windows boot investigation
 
-Updated 2026-10-27. This file describes the standalone Rust/Unicorn model.
+Updated 2026-10-30. This file describes the standalone Rust/Unicorn model.
 The old QEMU, forced-IRQ and clock-acceleration notes are archived in
 [boot-investigation-legacy.md](boot-investigation-legacy.md); they contain
 superseded conclusions and must not guide the current board implementation.
@@ -16,20 +16,165 @@ With the timer and DSP boot interface modeled, execution reaches the DSP-start
 handshake described below. The splash remains; RD16024 execution is still absent.
 Neither mounting nor a splash proves a phone boot.
 
+### Checkpoint — 2026-10-29
+
+The current source tree contains the DSP runtime queue lifecycle, internal-flash
+command handling, serial identification controller and the new I2C/PMIC work.
+The firmware and NAND images remain unmodified. Native validation passes **57
+tests**, including a check that runtime writes to the CLA working image do not
+alter its read-only mirror.
+
+`src/i2c.rs` now models the PNX master controller instead of treating every
+transaction as an absent slave:
+
+- separate TX and RX FIFOs, FIFO levels and transmitted/received counters;
+- START/STOP, write-one-to-clear status and the firmware-used interrupt bits;
+- a PCF5060X-compatible register slave at seven-bit address `0x09`;
+- sequential register-pointer reads and writes; all other addresses still NACK;
+- an 8:1 ARM/peripheral-clock ratio. With firmware dividers 52/103, one byte
+  takes about 11,300 ARM instruction slots instead of the earlier 1,400.
+
+This progresses through the former `0x220604f1` failure. The previously failing
+exchange is a read of PCF5060X register `0x05` after a successful read of
+register `0x24`; it now completes through the normal IRQ28 driver path. PMIC
+register `OOCS` defaults to the documented `BATOK|BACKOK|TEMPOK` bits, and the
+RTC starts from the CLA build timestamp in BCD rather than an invented current
+date. Useful evidence directories are `pcf5060x-v1`, `pcf-irq-lifecycle`,
+`pcf5060x-timing8` and `pcf-valid-rtc` under
+`D:\CodexBuild\SamsungE380-Emu`.
+
+The INTC re-entry failure has also been resolved without changing guest RTOS
+state. A per-line EOI now marks acknowledgement, but the controller remains in
+service until the CPU has actually returned to a non-IRQ context with CPSR.I
+clear. This prevents the generic dispatcher's early EOI from opening a nested
+IRQ window, while still allowing normal delivery when the scheduler's own
+nesting byte is one. No RTOS byte is seeded or cleared by the emulator. The
+system timer uses the same 8:1 ARM/peripheral ratio as I2C and retains its
+fractional remainder between updates.
+
+The CLA execution window at `0x20000000` also contains firmware-owned writable
+tables. A normal `str` at `0x21188d1a` updates the second word of the table at
+`0x2023e284`; treating the whole window as read-only caused a false WRITE_PROT.
+The working image is now writable, while the separate copy at `0xea000000`
+remains read-only. At runtime `0x2023e288` becomes 5 and `0xea23e288` remains
+zero, so the supplied CLA bytes are not modified.
+
+DSP runtime command `0x2001` is now included in the opt-in E830 HLE. The original
+routine clears bit 0 at `0x50505018`, sends `0x2001`, and waits for exactly one
+bit-0 event; omitting that event produced report `0xee07018a`. The modeled event
+removes that timeout without changing the mailbox payload or guest queues.
+
+The latest full-TFS run reaches **600,000,000 instructions** with no memory
+fault and no fatal loop. The former reports `0x220604f1`, `0x22030bf1`,
+`0x220332f1` and `0xee07018a` are absent after their resolved call sites. The
+ordinary instruction budget stops at PC `0x20848112`, inside active Nucleus
+memory-management work. The final 5,001-instruction trace contains 644 distinct
+PCs, so this is not a one-instruction trap. The run delivers 1,264 IRQs,
+advances `TMD_System_Clock` at `0x309011f0` to 503 and produces four complete
+LCD frames. The last frame is unchanged between 300M and 600M. Keyboard-init
+and standby-look counters remain zero, so the main menu is still unverified.
+`0x30033cfc` also remains zero.
+
+Evidence is in `working-image-300m`, `dsp-2001-300m`, `dsp-2001-600m` and
+`late-active-600m` under `D:\CodexBuild\SamsungE380-Emu`.
+
+Reproduction uses the installed NAND image
+`D:\CodexBuild\SamsungE380-Emu\firmware-work\E830XEGG1.full-tfs-2k.onenand.bin`
+with `E830_DSP_BOOT_HLE=1`. The erased Downloads copy
+`E830XEGG1.onenand.bin` is not a valid replacement.
+
+### Trace-buffer and IRQ21 investigation — 2026-10-30
+
+The next clean-run failure occurs at instruction **855,125,069**: a
+`READ_UNMAPPED` at `0xe24ee600`, PC `0x20847af4`, after report `0x133a0500`.
+This is secondary damage, not a missing memory map. The firmware-owned event
+stream pointer at `0x3001a684` has advanced beyond its intended buffer and the
+writer at `0x2118f164` overwrites MP/radio state. The decisive writes are at
+instructions 855,115,720/724: `0x000c` and `0x5051` are stored at
+`0x304a52e4/0x304a52e6`. The later MP handler then sees a false ready message
+whose body at `0x304a6da4` is zero; its reporter runs with task-ID sentinel
+`0xff` and indexes a table outside its valid range.
+
+The firmware's normal drain path is now identified. IRQ21 dispatches through
+`0x20011b84`, clears timer status bit `0x100` at `0x50501008`, and calls the
+runtime callback stored at `0x309a1150`. Initialization at `0x2098d03e`
+registers callback `0x20143185`, so the actual drain starts at `0x20143184`.
+Adjacent callbacks are `0x201430ed` at `0x309a114c` for IRQ20 and
+`0x215a7d11` at `0x309a1154` for IRQ19.
+
+The drain confirms these buffer layouts without patching guest state:
+
+- main event stream: base `0x30492fd0`, normal wrap threshold `0x304a0324`,
+  hard guard `0x304a1fd0`, write pointer at `0x3001a684`;
+- auxiliary stream at `0x30491eda`, pointer `0x3001a688`, warning at 120
+  halfwords;
+- ring at `0x30491fca`, pointer `0x3001a68c`, maximum `0x7d0` halfwords;
+- auxiliary stream at `0x30492f6a`, pointer `0x3001a690`, warning at 50
+  halfwords;
+- backend callback pointer `0x3001a26c` resolves at runtime to `0x20584c95`.
+
+Timer writes around the first observed drain are also pinned down. Firmware
+writes control `0x07e0` at `0x2098cf7c`; IRQ20 acknowledges it as `0x0760` at
+`0x200117e6`; then `0x2098d594/0x2098d59a` program `+0x0c=0x1388` and
+`+0x14=0x125c`; IRQ21 acknowledges with `0x06e0` at `0x20011b98`. This proves
+that bits `0x80` and `0x100` have separate interrupt lifecycles. Their handler
+write sequences also prove write-zero-to-clear behavior: IRQ20 writes bit 7 as
+zero while preserving bit 8 as one, and IRQ21 does the inverse.
+
+The timer cadence is now constrained directly from the trace. When
+period `+0x0c=5000`, match0 `+0x10=0` and match1 `+0x14=4700` are programmed,
+the counter is 586. The next
+genuine IRQ21 appears 32,913 guest instructions later, matching
+`(4700-586)*8 = 32,912` within the one-instruction hook boundary. IRQ20 follows
+2,400 instructions later, exactly `(5000-4700)*8`. Thus the observed `0x600`
+mode is a 5000-tick period with an early compare at 4700 and a period/reset
+event at 5000. Before `0x2098cf7c` adds `0x600`, the control value is `0x01e0`;
+bit `0x40` therefore predates this mode. Static driver decoding resolves the
+fields: `0x20/0x40` enable IRQ20/IRQ21, `0x80/0x100` are their W0C statuses,
+and `0x200/0x400` enable match0/match1. Firmware explicitly waits until the
+counter is at most 4500 before setting `0x600`, so match1=4700 remains ahead
+and match0=0 occurs at the next 5000-tick boundary. The previously observed
+immediate IRQ20/IRQ21 entries were artifacts of treating status bits as normal
+writable storage.
+
+`src/machine.rs` now contains a candidate implementation limited to this exact
+observed combination: periodic modulo-5000 counting, IRQ21/status `0x100` at
+match1 `+0x14`, IRQ20/status `0x80` at match0 `+0x10=0`, and W0C status writes.
+Static tests encode the measured 586→4700→0 sequence. Per the user's request,
+this candidate has not yet been compiled or runtime-tested.
+
+Two diagnostic IRQ21 models were tested and then removed from the default
+emulator. They reached the genuine drain and prevented the original overwrite,
+but their cadence was wrong. One reached 1.2 billion instructions without a
+memory fault and kept `0x304a52e4` zero, yet had already entered fatal loop
+`0x20014b4c` after report `0x22060ff1`. The compare-channel variant preserved
+four LCD frames but eventually let the first auxiliary stream reach 120 words,
+reported `0xe70204f0`, and its secondary reporter again accessed
+`0xe24ee600`. Therefore neither experiment is retained as hardware behavior.
+
+Evidence is under `D:\CodexBuild\SamsungE380-Emu` in `mp-buffer-writes`,
+`invalid-index-entry`, `timer-match-irq21-v2`, `timer-match-irq21-1200m`,
+`irq21-post-drain-report`, `error-22060ff1-source`,
+`timer-compare-dual-300m` and `timer-control-before-irq21`. The external
+`research/seftool` checkout contains genuine PNX5230 loader binaries and names
+`pd_timer.c`, but no source-level timer register definitions were found.
+
 ### Timer and DSP progress — 2026-10-27
 
 The 16-bit counter at `0x50501000` now advances with guest instruction progress,
 not counter reads. On rollover, control bit `0x20` enables status bit `0x80` and
 IRQ20; peripheral acknowledgement clears the pending level, not INTC EOI alone.
-With control bit `0x40`, rollover copies the programmed period at `+0x14` to
-the active period at `+0x0c`. The original firmware's delay bookkeeping requires
-this transition. This is a provisional instruction-based time model; physical
-clock frequency and complete timer semantics remain unverified.
+The older conclusion that bit `0x40` copied `+0x14` into `+0x0c` was wrong.
+Firmware helpers independently use `0x20/0x40` to enable IRQ20/IRQ21, while
+`0x80/0x100` are their W0C status bits. The observed `0x600` match mode and
+measured 4700/5000 cadence are described above. This remains a provisional
+instruction-based model; physical clock frequency and unobserved modes remain
+unverified.
 
-Local `timer-period-latch` and `long-boot-after-timer` probes observe active and
-next periods of 4700, 1336 interrupts taken, and `TMD_System_Clock=605` in the
-latter probe. These results supersede the earlier zero-clock observation; they
-do not establish correct real-time behavior or a working menu.
+The old `timer-period-latch` result, where `+0x0c` became 4700, came from the
+emulator's removed copy-on-rollover behavior and is superseded. Its IRQ count
+and `TMD_System_Clock=605` are retained only as historical evidence, not as
+validation of the corrected match-channel model.
 
 The DSP boot interface at `0x60100000` now provides TX/RX FIFO status, the boot
 signature response, uploads and readback in two independent memory spaces.
@@ -49,6 +194,56 @@ Native validation on 2026-10-27: `build-windows.ps1 -Test` passes **48 tests**,
 including timer rollover/acknowledgement, DSP upload/readback and the transition
 from boot-ROM commands to runtime mode. Firmware, probes, full dumps and vendor
 tools remain local and are excluded from the public repository.
+
+### Later DSP runtime progress — 2026-10-28
+
+The opt-in `E830_DSP_BOOT_HLE` path now recognizes the exact uploaded E830 DSP
+image before providing any runtime behavior. It preserves runtime readback and
+models the observed polling completions for commands `0x4001`, `0x1001` and
+`0x1002`. Command `0x1001` has two observed bit-0 events on `0x50505018`; the
+second follows the ARM acknowledgement of the first. Command `0x1002` has one
+observed bit-0 completion. The default path still fabricates no runtime DSP
+response.
+
+With `0x1002` acknowledged, execution advances past the previous
+`0xe903008a` timeout and repeatedly submits asynchronous DSP work. Four 64-byte
+entries at `0x304917ec`, `0x3049182c`, `0x3049186c` and `0x304918ac` fill with
+callback `0x215a7cb9`. The next submission reports `0xeb020002` at
+`0x2118d47a`, meaning no free entry. Callback `0x215a7cb8` normally clears
+`entry+0x10`, but no genuine DSP completion dispatch reaches it in the current
+model. Clearing those words directly would seed firmware state and is not an
+acceptable fix.
+
+The report is not an immediate stop. A clean run without a breakpoint continues
+to **1,200,000,000** instructions without a memory fault, but reaches the same
+fatal firmware trap at `0x20014b4c` by instruction **147,668,760** and remains
+there. Dynamic PC tracing gives the exact path
+`0x2001459c -> 0x20014686 -> 0x200149a2 -> 0x20014b3e -> 0x20014b4c`.
+The reporter passes `0xeb020002`; its later lookup of ID `0x0f72` resolves to
+RAM word `0x30033cfc`, which remains zero, and the firmware selects the fatal
+path. A focused write trace shows this word is only initialized to erased
+`0xffffffff` and later cleared with its table; it receives no successful
+runtime registration. Thus the missing asynchronous completion remains the
+causal blocker even though the initial report itself is non-fatal.
+
+At the `0x1002` transmit point, the relevant shared mailbox halfwords are at
+`0x600006bc` (`0xc8d4`), `0x600006be` (request-dependent values including
+`0x1800`, `0x2000`, `0x2800`, `0x4000` and `0x4800`) and `0x600006c0`
+(request-dependent payload). This confirms that repeated `0x1002` words are
+distinct requests, not a single polling command to acknowledge indefinitely.
+
+The physical interrupt table at `0x309a117c` confirms IRQ20 is the system timer
+(`0x200117d5`). IRQ19 dispatches through `0x20011b75` to a dynamic callback,
+and IRQ21 through `0x20011b85`; both are masked at the slot-exhaustion point.
+IRQ22 is enabled but belongs to a generic UART/DMA-style device context at
+`0x309a2d0c`, not to DSP completion. A diagnostic IRQ22 experiment invoked
+`0x20521265`, caused a level interrupt storm and eventually reported
+`0x22018052`; it was removed from the model. No forced interrupt remains.
+
+Native validation on 2026-10-28: `build-windows.ps1 -Test` passes **52 tests**.
+The focused evidence is stored only in excluded local run directories including
+`post-1002-tx`, `slot-exhaustion`, `dsp-mailbox-1002`, `late-failure-path`,
+`trace-0f72-writes` and `post-1002-long-clean`.
 
 ### Complete TFS image and current retail mount proof
 
@@ -340,9 +535,9 @@ main/spare image loading. Release binaries have been rebuilt with this profile.
 - `0x50405000`, IRQ 28 is I2C, not ADC. The controller follows the documented
   PNX I2C register/FIFO shape. Reference:
   https://github.com/torvalds/linux/blob/master/drivers/i2c/busses/i2c-pnx.c
-- Firmware sends `0x112`: START, slave `0x09`, write. With no slave attached the
-  model reports NACK after transfer time; firmware ISR `0x20cec930` clears its
-  own wait flag at `0x31f48ef0`. This is not a successful PMIC emulation.
+- Firmware sends `0x112`: START, slave `0x09`, write. The current model attaches
+  a PCF5060X-compatible register device at that address, including RX FIFO
+  delivery and the measured peripheral-clock scaling. Unknown addresses NACK.
 - Adding shared DSP storage resolved the access at `0x60000008` from
   `0x20d72b88`; adding OneNAND resolved the ID read at `0x4801e000` from
   `0x2112fada`. Neither memory fault is the present filesystem failure.
@@ -370,15 +565,22 @@ currently choose the highest bit; actual priority register semantics are TODO.
 IRQ entry respects CPSR.I. Force IRQ, SEED_NUCLEUS and CLOCK_ACCEL bridges have
 been removed. The opt-in E830_TIMER_PERIOD/E830_TIMER_IRQ source is diagnostic,
 not a validated hardware timer. The counter at `0x50501000` now advances with
-guest instruction progress, with provisional rollover and period-latch behavior
-described above; accurate physical timing still needs verification.
+guest instruction progress. The candidate model now covers the observed W0C
+status and 4700/5000 match cycle; accurate physical timing and other modes still
+need verification.
 
 ## Next work
 
-1. Identify documented RD16024 instruction encodings and DSP-side startup signaling.
-2. Implement only confirmed DSP behavior, then probe beyond `0x2098cddc`.
-3. Validate retail resource reads and later menu gates without firmware patches.
-4. Complete physical timer timing, interrupt priorities and I2C slave `0x09`.
+1. Compile and run the candidate periodic/W0C timer model when builds are next
+   allowed; first run its focused unit tests, then stop at `0x20143184`.
+2. Keep IRQ21 only if its 4700/5000 cadence reproduces the `0x20143184` drain
+   without `0xe70204f0`, `0x22060ff1` or a secondary reporter fault.
+3. Repeat the 1.2-billion-instruction run and verify that `0x3001a684` remains
+   below `0x304a0324`, `0x304a52e4` stays untouched, and four LCD frames remain.
+4. Keep PCF5060X status/RTC and DSP completions evidence-based; do not invent
+   power events or mailbox results merely to select a successful branch.
+5. Preserve the real firmware, NAND and RTOS state; no forced IRQ, direct state
+   seeding, fake menu or firmware patch is permitted.
 
 Keep the real firmware untouched, preserve the desktop interface, and record
 new evidence here. A missing filesystem must not be bypassed with RTOS state,
