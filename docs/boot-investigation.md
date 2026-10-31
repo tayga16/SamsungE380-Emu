@@ -28,6 +28,82 @@ visibly unusual colours, already present in the guest's graphics buffer rather
 than introduced by LCD addressing. This is a genuine post-splash screen, not
 the main menu. Neither mounting nor animation frames prove boot.
 
+### Checkpoint — 2026-10-31: instruction-hook overhead reduction
+
+The existing CPU already uses Unicorn 2.1.5's TCG JIT. This change reduces
+host work in the global instruction hook; it does not replace the CPU engine,
+accelerate guest clocks, skip additional guest instructions or bypass boot.
+
+- The RTOS nesting byte is read only for an active IRQ-service trace or actual
+  IRQ entry, using a one-byte stack buffer instead of a heap allocation.
+  It remains diagnostic, never an IRQ eligibility condition.
+- CPSR is read for possible post-EOI architectural service return, enabled
+  pending IRQ delivery, or active diagnostics. It is never cached across
+  guest instructions, so guest MSR/exception returns are observed immediately.
+- IRQ-service diagnostic keys are computed only while that trace is active
+  and within its limits. Pending sources are not repeatedly recomputed during
+  ordinary delivery. Disabled DSP/wake/timer traces skip their PC filters.
+- DMA status returns immediately when the low eight raw terminal-count bits
+  are zero, avoiding eight channel-config HashMap lookups. A fully masked
+  INTC returns no enabled sources without traversing device IRQ levels.
+  Neither shortcut acknowledges or discards a device status.
+- Four per-instruction delay/memset signature-set lookups are replaced by one
+  PC-to-kind bitmask lookup, built from the same detected addresses. Overlapping
+  signatures retain all membership bits and the unchanged handler priority;
+  no additional loops are skipped and existing budget accounting is unchanged.
+
+DMA, DSP serial, I2C and system-timer advancement retain the original order
+and exact per-instruction boundaries, including masked-IRQ time and existing
+fast-forward accounting. No firmware, NAND, GUI layout or peripheral timing
+was changed. The read-only input NAND hash remains
+`d305c8e0b27e86ecec70534be1ee2c917c1556e675d5868573e600b7cf341a56`.
+
+Same-host release CLI A/B runs use the verified physical NAND,
+`E830_DSP_BOOT_HLE=1`, no tracing and a 600,000,000-instruction budget.
+Original wall time was **237.077 s**; optimized time was **74.057 s**
+(approximately **3.20x** throughput, **68.8%** less wall time). A second pair
+took **298.466 s** original and **121.624 s** optimized (**2.45x**); its
+optimized BootReport and LCD image also match the original exactly. Host load
+affects these measurements, so 74 seconds is not a fixed loading-time claim. These are
+bounded CLI execution measurements, not an exact GUI time-to-first-SIM-screen
+or a hardware-clock validation. They do not imply that the main menu works.
+`tools/run-probe.py` now reports child-process elapsed time for future probes.
+
+The complete BootReport and both RAM peeks are identical after normalizing
+only the LCD destination filename: PC `0x204b00d0`, CPSR `0xdf`, no fault,
+11,792 IRQs, clock 1,308, one HKBD-init and 48 standby dispatches, 26 LCD
+full-screen-equivalent writes. The final **Insert SIM / SOS** PPM is identical,
+SHA-256 `a7ad2f679d350cb9e684fabb2975de8a26f0484b266459e5aea7b9403a160d07`.
+Evidence stays local in `proof/native-windows/perf-before-600m.*` and
+`perf-after-600m.*`, `perf-final-600m.*` and `perf-sites-600m.*`.
+
+The final release including the combined loop lookup completed the same 600M
+probe in **96.258 s** with identical full report, peeks and LCD SHA-256, and
+empty diagnostic stderr. Its incremental speedup cannot be isolated reliably
+from these variable host-load measurements: 150M probes were 14.849 s before
+and 18.987 s after; alternating repeat runs were 23.227/19.427 s and
+20.414/11.748 s (before/after). The substantial overall improvement is verified,
+but no separate percentage is claimed for this second small optimization.
+
+Regression tests cover every DMA channel mask, reserved status bits and
+preserved raw status; selective CPSR reads with trace both on and off;
+EOI plus unmask return ordering; unchanged RTOS nesting; and a guest MSR
+that must deliver IRQ before the following instruction executes. Two additional
+tests compare every combined-loop membership including overlaps/empty sets and
+the real nested/fade signature overlap.
+Native `build-windows.ps1 -Test` passes **78 core + 7 GUI/runner = 85 tests**.
+Release GUI/CLI are rebuilt and copied into the existing local `dist`;
+their SHA-256 hashes match the release outputs. The launch helper and selected
+NAND configuration are preserved. No firmware/NAND copies or full dumps were
+added. The initial validation stayed local; the user subsequently requested
+publication of the source, tests and notes to the GitHub repository.
+Final GUI SHA-256: `487523580e8ff7d2ed4230a6b84e444e37d4013201af0da8b8a1a130e21502c6`;
+CLI: `ccfbca91dc8af90f0170591f9a213419a9b215e77865524ad7be1dea1b376f53`.
+
+The global instruction callback remains in place. Block/event scheduling is
+future work requiring stronger interrupt-boundary proofs; it was not needed
+for this first measurable improvement. Keyboard/SIM/menu work is still pending.
+
 ### Checkpoint — 2026-10-31: GUI physical NAND selection
 
 The Library now has `Select NAND...`, the resolved image path, and

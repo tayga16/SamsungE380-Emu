@@ -201,6 +201,12 @@ fn advance_dma(uc: &mut Unicorn<'_, E830State>) {
     }
 }
 
+fn read_irq_nesting(uc: &Unicorn<'_, E830State>) -> u8 {
+    // No heap allocation for a single diagnostic RAM byte.
+    let mut byte = [u8::MAX];
+    if uc.mem_read(RTOS_NESTING_DEPTH, &mut byte).is_ok() { byte[0] } else { u8::MAX }
+}
+
 fn dispatch_table(uc: &Unicorn<'_, E830State>) -> Option<u32> {
     let node = uc.reg_read(RegisterARM::R5).ok()?;
     let bytes = diagnostic_ram_read(uc, node.checked_add(4)?, 4)?;
@@ -730,10 +736,7 @@ struct E830State {
     instructions: u64,
     fast_forwarded_instructions: u64,
     instruction_budget: u64,
-    delay_loop_pcs: HashSet<u64>,
-    nested_delay_loop_pcs: HashSet<u64>,
-    memset_loop_pcs: HashSet<u64>,
-    fade_delay_loop_pcs: HashSet<u64>,
+    loop_kinds: HashMap<u64, u8>,
     trace_mmio: bool,
     recent_mmio: VecDeque<MmioAccess>,
     memory_fault: Option<MemoryFault>,
@@ -858,10 +861,9 @@ impl E830State {
             instructions: 0,
             fast_forwarded_instructions: 0,
             instruction_budget: u64::MAX,
-            delay_loop_pcs,
-            nested_delay_loop_pcs,
-            memset_loop_pcs,
-            fade_delay_loop_pcs,
+            loop_kinds: collect_loop_kinds([
+                delay_loop_pcs, nested_delay_loop_pcs, memset_loop_pcs, fade_delay_loop_pcs,
+            ]),
             trace_mmio,
             recent_mmio: VecDeque::with_capacity(MAX_RECENT_MMIO),
             memory_fault: None,
@@ -1029,6 +1031,11 @@ impl E830State {
 
     fn dma_interrupt_status(&self) -> u32 {
         let raw = self.registers.get(&(DMA_BASE + 0x14)).copied().unwrap_or(0);
+        // No channel mask can turn an absent terminal count into an IRQ.
+        // This is the usual case and avoids eight map lookups per instruction.
+        if raw & 0xff == 0 {
+            return 0;
+        }
         let enabled = (0..8).fold(0, |mask, channel| {
             let config = self.registers.get(&(DMA_BASE + 0x110 + channel * 0x20))
                 .copied().unwrap_or(0);
@@ -1131,7 +1138,7 @@ impl E830State {
             .get(&INTC_ENABLE_MASK_REGISTER)
             .copied()
             .unwrap_or(u32::MAX);
-        self.pending_lines() & !mask
+        if mask == u32::MAX { 0 } else { self.pending_lines() & !mask }
     }
 
     fn read_register(&mut self, address: u32, size: usize, pc: u32) -> u64 {
@@ -1895,6 +1902,23 @@ fn map_flash_window(cpu: &mut Unicorn<'static, E830State>) -> Result<(), Machine
 }
 const COUNTING_DELAY_LOOP: [u8; 10] = [0x01, 0x32, 0x01, 0x30, 0x88, 0x42, 0xfb, 0xd3, 0x70, 0x47];
 
+const LOOP_COUNTING: u8 = 1;
+const LOOP_NESTED: u8 = 2;
+const LOOP_MEMSET: u8 = 4;
+const LOOP_FADE: u8 = 8;
+
+fn collect_loop_kinds(sets: [HashSet<u64>; 4]) -> HashMap<u64, u8> {
+    let mut kinds = HashMap::new();
+    for (index, pcs) in sets.into_iter().enumerate() {
+        for pc in pcs {
+            // Signatures can overlap (notably nested/fade delays). Preserve
+            // every former membership result, including handler priority.
+            *kinds.entry(pc).or_insert(0) |= 1 << index;
+        }
+    }
+    kinds
+}
+
 fn find_counting_delay_loop_pcs(cla: &[u8]) -> HashSet<u64> {
     cla.windows(COUNTING_DELAY_LOOP.len())
         .enumerate()
@@ -2132,11 +2156,12 @@ fn install_hooks(cpu: &mut Unicorn<'static, E830State>) -> Result<(), MachineErr
                     state.pc_log_remaining -= 1;
                     eprintln!("[e830-pc] 0x{address:08x}");
                 }
+                let kinds = state.loop_kinds.get(&address).copied().unwrap_or(0);
                 (
-                    state.delay_loop_pcs.contains(&address),
-                    state.nested_delay_loop_pcs.contains(&address),
-                    state.memset_loop_pcs.contains(&address),
-                    state.fade_delay_loop_pcs.contains(&address),
+                    kinds & LOOP_COUNTING != 0,
+                    kinds & LOOP_NESTED != 0,
+                    kinds & LOOP_MEMSET != 0,
+                    kinds & LOOP_FADE != 0,
                     remaining,
                 )
             }
@@ -2256,7 +2281,7 @@ fn install_hooks(cpu: &mut Unicorn<'static, E830State>) -> Result<(), MachineErr
             eprintln!("[e830-watch] pc=0x{address:08x} insns={total} {}", values.join(" "));
             uc.get_data_mut().watch_remaining -= 1;
         }
-        if DSP_TRACE_PCS.contains(&address) {
+        if uc.get_data().trace_dsp && DSP_TRACE_PCS.contains(&address) {
             let should_log = {
                 let state = uc.get_data();
                 state.trace_dsp
@@ -2299,9 +2324,10 @@ fn install_hooks(cpu: &mut Unicorn<'static, E830State>) -> Result<(), MachineErr
             }
         }
 
-        let wake_pc = (WAKE_WAIT_TRACE_START..=WAKE_WAIT_TRACE_END).contains(&address)
-            || WAKE_IRQ_TRACE_PCS.contains(&address);
-        if wake_pc && uc.get_data().trace_wake {
+        if uc.get_data().trace_wake
+            && ((WAKE_WAIT_TRACE_START..=WAKE_WAIT_TRACE_END).contains(&address)
+                || WAKE_IRQ_TRACE_PCS.contains(&address))
+        {
             let total = uc.get_data().instructions.saturating_add(uc.get_data().fast_forwarded_instructions);
             let after = uc.get_data().trace_wake_after;
             if total >= after && uc.get_data().trace_wake_remaining > 0 {
@@ -2318,7 +2344,7 @@ fn install_hooks(cpu: &mut Unicorn<'static, E830State>) -> Result<(), MachineErr
             }
         }
 
-        if TIMER_TRACE_PCS.contains(&address) && uc.get_data().trace_timer {
+        if uc.get_data().trace_timer && TIMER_TRACE_PCS.contains(&address) {
             let total = uc.get_data().instructions.saturating_add(uc.get_data().fast_forwarded_instructions);
             let after = uc.get_data().trace_timer_after;
             if total >= after && uc.get_data().trace_timer_remaining > 0 {
@@ -2375,33 +2401,41 @@ fn install_hooks(cpu: &mut Unicorn<'static, E830State>) -> Result<(), MachineErr
 
         // Advance device time even while the CPU masks interrupts.
         advance_dma(uc);
-        let service_cpsr = uc.reg_read(RegisterARM::CPSR).unwrap_or(0) as u32;
-        let service_nesting = uc
-            .mem_read_as_vec(RTOS_NESTING_DEPTH, 1)
-            .ok()
-            .and_then(|bytes| bytes.first().copied())
-            .unwrap_or(u8::MAX);
-        let service_returned = interrupt_service_returned(
-            service_cpsr,
-            uc.get_data().timer_irq_in_service,
-            uc.get_data().irq_eoi_seen,
-        );
-        {
+        let trace_service = {
             let state = uc.get_data();
-            let total = state.instructions.saturating_add(state.fast_forwarded_instructions);
+            state.trace_irq_service
+                && total >= state.trace_irq_service_after
+                && state.trace_irq_service_remaining > 0
+        };
+        // CPSR may change on ANY guest instruction: never cache it across
+        // instructions. But no service can return before EOI, and the RTOS
+        // nesting byte is diagnostic only, not part of IRQ eligibility.
+        let service_cpsr = if trace_service
+            || (uc.get_data().timer_irq_in_service && uc.get_data().irq_eoi_seen)
+        {
+            Some(uc.reg_read(RegisterARM::CPSR).unwrap_or(0) as u32)
+        } else {
+            None
+        };
+        let service_returned = service_cpsr.is_some_and(|cpsr| interrupt_service_returned(
+            cpsr, uc.get_data().timer_irq_in_service, uc.get_data().irq_eoi_seen,
+        ));
+        if trace_service {
+            let service_cpsr = service_cpsr.unwrap();
+            let service_nesting = read_irq_nesting(uc);
+            let state = uc.get_data();
+            let pending = state.pending_lines();
+            let mask = state.registers.get(&INTC_ENABLE_MASK_REGISTER).copied().unwrap_or(u32::MAX);
             let key = (
                 state.timer_irq_in_service,
                 state.irq_eoi_seen,
                 service_nesting,
                 state.irq_entry_nesting,
                 service_cpsr & (CPSR_MODE_MASK | CPSR_IRQ_DISABLE | CPSR_THUMB),
-                state.pending_lines(),
-                state.enabled_pending_lines(),
+                pending,
+                pending & !mask,
             );
-            if state.trace_irq_service
-                && total >= state.trace_irq_service_after
-                && state.trace_irq_service_remaining > 0
-                && (state.timer_irq_in_service || state.irq_eoi_seen || key.6 != 0)
+            if (state.timer_irq_in_service || state.irq_eoi_seen || key.6 != 0)
                 && state.trace_irq_service_last != Some(key)
             {
                 eprintln!(
@@ -2418,14 +2452,14 @@ fn install_hooks(cpu: &mut Unicorn<'static, E830State>) -> Result<(), MachineErr
             state.timer_irq_in_service = false;
             state.irq_eoi_seen = false;
         }
-        let irq_is_pending = {
+        let pending = {
             let state = uc.get_data_mut();
             let total = state.instructions.saturating_add(state.fast_forwarded_instructions);
             state.advance_dsp_serial(total);
             state.i2c.advance(total);
             state.advance_system_timer(total);
             if state.timer_irq_period == 0 {
-                state.enabled_pending_lines() != 0
+                state.enabled_pending_lines()
             } else {
                 if !state.timer_irq_pending {
                     // Drive the tick cadence off *total* elapsed guest
@@ -2444,16 +2478,14 @@ fn install_hooks(cpu: &mut Unicorn<'static, E830State>) -> Result<(), MachineErr
                         state.timer_irq_pending = true;
                     }
                 }
-                state.enabled_pending_lines() != 0
+                state.enabled_pending_lines()
             }
         };
-        if irq_is_pending {
-            let cpsr = uc.reg_read(RegisterARM::CPSR).unwrap_or(0) as u32;
+        if pending != 0 {
+            let cpsr = service_cpsr.unwrap_or_else(|| uc.reg_read(RegisterARM::CPSR).unwrap_or(0) as u32);
             let in_service = uc.get_data().timer_irq_in_service;
-            let pending = uc.get_data().enabled_pending_lines();
-            let line_enabled = pending != 0;
             let line = 31 - pending.leading_zeros();
-            if line_enabled && interrupt_delivery_allowed(cpsr, in_service) {
+            if interrupt_delivery_allowed(cpsr, in_service) {
                 // ARM IRQ entry: the return address is the instruction we were
                 // about to run, recovered by the handler's `sub lr,lr,#4` from
                 // lr = address + 4. Switch to IRQ mode first so the banked LR
@@ -2468,6 +2500,7 @@ fn install_hooks(cpu: &mut Unicorn<'static, E830State>) -> Result<(), MachineErr
                     && uc.reg_write(RegisterARM::LR, return_addr).is_ok()
                     && uc.reg_write(RegisterARM::PC, IRQ_VECTOR_TARGET).is_ok()
                 {
+                    let service_nesting = read_irq_nesting(uc);
                     let state = uc.get_data_mut();
                     state.irqs_taken = state.irqs_taken.saturating_add(1);
                     state.active_irq_line = line;
@@ -2818,6 +2851,120 @@ mod tests {
         SYSTEM_TIMER_IRQ20_STATUS, SYSTEM_TIMER_IRQ21_ENABLE, SYSTEM_TIMER_IRQ21_STATUS,
         SYSTEM_TIMER_MATCH0_ENABLE, SYSTEM_TIMER_MATCH1_ENABLE, SYSTEM_TIMER_MATCH_IRQ,
     };
+
+    #[test]
+    fn dma_irq_fast_path_preserves_raw_status_and_each_channel_mask() {
+        let mut state = E830State::new(false, vec![0xff; 0x1000],
+            Default::default(), Default::default(), Default::default(), Default::default());
+        for channel in 0..8 {
+            state.registers.insert(super::DMA_BASE + 0x110 + channel * 0x20, 0x8000);
+        }
+        // Upper reserved status bits must not raise a channel IRQ.
+        state.registers.insert(super::DMA_BASE + 0x14, 0xffff_ff00);
+        assert_eq!(state.dma_interrupt_status(), 0);
+        for channel in 0..8 {
+            let config = super::DMA_BASE + 0x110 + channel * 0x20;
+            state.registers.insert(super::DMA_BASE + 0x14, 0xffff_ff00 | (1 << channel));
+            assert_eq!(state.dma_interrupt_status(), 1 << channel);
+            state.registers.insert(config, 0);
+            assert_eq!(state.dma_interrupt_status(), 0);
+            state.registers.insert(config, 0x8000);
+        }
+        state.registers.insert(super::DMA_BASE + 0x14, 0xff);
+        state.registers.insert(super::INTC_ENABLE_MASK_REGISTER, u32::MAX);
+        assert_eq!(state.enabled_pending_lines(), 0);
+        assert_eq!(state.dma_interrupt_status(), 0xff); // mask is not ack
+        state.registers.insert(super::INTC_ENABLE_MASK_REGISTER, !(1 << super::DMA_IRQ));
+        assert_eq!(state.enabled_pending_lines(), 1 << super::DMA_IRQ);
+    }
+
+    #[test]
+    fn selective_cpsr_reads_observe_unmask_and_eoi_on_the_next_instruction() {
+        use super::RegisterARM;
+        for trace in [false, true] {
+            let mut cla = vec![0xff; (super::IRQ_VECTOR_TARGET - u64::from(FLASH_BASE)) as usize + 0x1000];
+            cla[..4].copy_from_slice(&[0x54, 0xf1, 0x9f, 0xe5]);
+            cla[0x15c..0x160].copy_from_slice(&(FLASH_BASE + 0x100).to_le_bytes());
+            let firmware = crate::FirmwareSet::from_bytes(cla, vec![1], None, None).unwrap();
+            let mut machine = E830Machine::new(firmware, false).unwrap();
+            let task_pc = 0x3000_1000u32;
+            let cpu = machine.cpu.raw_engine();
+            cpu.mem_write(u64::from(task_pc), &[0x00, 0x00, 0xa0, 0xe1, 0xfd, 0xff, 0xff, 0xea]).unwrap();
+            cpu.mem_write(super::RTOS_NESTING_DEPTH, &[5]).unwrap();
+            cpu.reg_write(RegisterARM::CPSR, 0xdf).unwrap();
+            cpu.reg_write(RegisterARM::PC, u64::from(task_pc)).unwrap();
+            cpu.reg_write(RegisterARM::R4, 0x1234_5678).unwrap();
+            let state = cpu.get_data_mut();
+            state.trace_irq_service = trace;
+            state.trace_irq_service_after = 0;
+            state.trace_irq_service_remaining = 20;
+            state.timer_irq_period = 0;
+            state.timer_irq_pending = true;
+            state.timer_irq_index = super::DMA_IRQ;
+            state.timer_irq_in_service = true;
+            state.irq_eoi_seen = true;
+            state.registers.insert(super::INTC_ENABLE_MASK_REGISTER, !(1 << super::DMA_IRQ));
+
+            let masked = machine.run(2).unwrap();
+            assert_eq!(masked.irqs_taken, 0);
+            assert!(machine.cpu.raw_engine().get_data().timer_irq_in_service);
+            // A change between slices must not reuse the old CPSR.I value.
+            let cpu = machine.cpu.raw_engine();
+            cpu.reg_write(RegisterARM::CPSR, 0x1f).unwrap();
+            cpu.get_data_mut().irq_eoi_seen = false;
+            let before_eoi = machine.run(1).unwrap();
+            assert_eq!(before_eoi.irqs_taken, 0); // unmask alone is insufficient
+            assert!(machine.cpu.raw_engine().get_data().timer_irq_in_service);
+            let return_pc = u64::from(before_eoi.pc) + 4;
+            machine.cpu.raw_engine().get_data_mut().irq_eoi_seen = true;
+            let entered = machine.run(1).unwrap();
+            assert_eq!(entered.irqs_taken, 1);
+            assert_eq!(u64::from(entered.pc), super::IRQ_VECTOR_TARGET);
+            assert_eq!(entered.cpsr & 0x9f, 0x92);
+            assert_eq!(entered.r4, 0x1234_5678);
+            let cpu = machine.cpu.raw_engine();
+            assert_eq!(cpu.reg_read(RegisterARM::SPSR).unwrap(), 0x1f);
+            assert_eq!(cpu.reg_read(RegisterARM::LR).unwrap(), return_pc);
+            assert_eq!(cpu.get_data().irq_entry_nesting, 5);
+            assert_eq!(super::read_irq_nesting(cpu), 5); // diagnostic byte is untouched
+            assert!(!cpu.get_data().irq_eoi_seen);
+        }
+    }
+
+    #[test]
+    fn guest_msr_unmask_delivers_pending_irq_before_the_following_instruction() {
+        use super::RegisterARM;
+        let mut cla = vec![0xff; (super::IRQ_VECTOR_TARGET - u64::from(FLASH_BASE)) as usize + 0x1000];
+        cla[..4].copy_from_slice(&[0x54, 0xf1, 0x9f, 0xe5]);
+        cla[0x15c..0x160].copy_from_slice(&(FLASH_BASE + 0x100).to_le_bytes());
+        let firmware = crate::FirmwareSet::from_bytes(cla, vec![1], None, None).unwrap();
+        let mut machine = E830Machine::new(firmware, false).unwrap();
+        let task_pc = 0x3000_1000u32;
+        let cpu = machine.cpu.raw_engine();
+        // msr cpsr_c, r0; mov r4, #7; b . -- R4 must NOT reach seven.
+        cpu.mem_write(u64::from(task_pc), &[
+            0x00, 0xf0, 0x21, 0xe1, 0x07, 0x40, 0xa0, 0xe3, 0xfe, 0xff, 0xff, 0xea,
+        ]).unwrap();
+        cpu.reg_write(RegisterARM::CPSR, 0xdf).unwrap();
+        cpu.reg_write(RegisterARM::PC, u64::from(task_pc)).unwrap();
+        cpu.reg_write(RegisterARM::R0, 0x1f).unwrap();
+        cpu.reg_write(RegisterARM::R4, 0x1234).unwrap();
+        let state = cpu.get_data_mut();
+        state.trace_irq_service = false;
+        state.timer_irq_period = 0;
+        state.timer_irq_pending = true;
+        state.timer_irq_index = super::DMA_IRQ;
+        state.timer_irq_in_service = false;
+        state.registers.insert(super::INTC_ENABLE_MASK_REGISTER, !(1 << super::DMA_IRQ));
+        let report = machine.run(2).unwrap();
+        assert!(report.memory_fault.is_none());
+        assert_eq!(report.irqs_taken, 1);
+        assert_eq!(u64::from(report.pc), super::IRQ_VECTOR_TARGET);
+        assert_eq!(report.r4, 0x1234);
+        let cpu = machine.cpu.raw_engine();
+        assert_eq!(cpu.reg_read(RegisterARM::SPSR).unwrap(), 0x1f);
+        assert_eq!(cpu.reg_read(RegisterARM::LR).unwrap(), u64::from(task_pc) + 8);
+    }
 
     #[test]
     fn state_dispatch_counters_classify_tables_not_execution_at_data_symbols() {
@@ -3686,6 +3833,40 @@ mod tests {
             find_counting_delay_loop_pcs(&image),
             [u64::from(FLASH_BASE) + 5].into()
         );
+    }
+
+    #[test]
+    fn combined_loop_lookup_preserves_all_memberships_and_overlaps() {
+        let sets = [
+            [0x2000, 0x2100, 0x2500].into(),
+            [0x2100, 0x2200, 0x2500].into(),
+            [0x2300, 0x2500].into(),
+            [0x2200, 0x2400, 0x2500].into(),
+        ];
+        let kinds = super::collect_loop_kinds(sets.clone());
+        for pc in (0x1f00..=0x2600).chain([0, u64::MAX]) {
+            let combined = kinds.get(&pc).copied().unwrap_or(0);
+            for (index, original) in sets.iter().enumerate() {
+                assert_eq!(combined & (1 << index) != 0, original.contains(&pc));
+            }
+        }
+        assert_eq!(kinds.len(), 6);
+        assert_eq!(kinds[&0x2500], 0x0f);
+        assert!(super::collect_loop_kinds(Default::default()).is_empty());
+    }
+
+    #[test]
+    fn combined_loop_lookup_preserves_detected_nested_fade_overlap() {
+        let mut image = vec![0; 64];
+        image[8..24].copy_from_slice(&NESTED_DELAY_LOOP);
+        let kinds = super::collect_loop_kinds([
+            find_counting_delay_loop_pcs(&image),
+            find_nested_delay_loop_pcs(&image),
+            super::find_memset_loop_pcs(&image),
+            find_fade_delay_loop_pcs(&image),
+        ]);
+        assert_eq!(kinds[&(u64::from(FLASH_BASE) + 10)],
+            super::LOOP_NESTED | super::LOOP_FADE);
     }
 
     #[test]

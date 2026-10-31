@@ -3,6 +3,7 @@ import argparse
 import os
 from pathlib import Path
 import subprocess
+import time
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("name")
@@ -25,6 +26,8 @@ command = [str(root / "target" / "release" / "e830-cli.exe"),
            "--tfs", str(root / "firmware" / "E830XEGG1.tfs"), *arguments]
 with (output / f"{options.name}.log").open("wb") as stdout, \
         (output / f"{options.name}.mmio").open("wb") as stderr:
+    started = time.perf_counter()
     result = subprocess.run(command, cwd=root, env=environment, stdout=stdout, stderr=stderr)
-print(f"Exit code: {result.returncode}; report: {output / (options.name + '.log')}")
+    elapsed = time.perf_counter() - started
+print(f"Exit code: {result.returncode}; elapsed: {elapsed:.3f}s; report: {output / (options.name + '.log')}")
 raise SystemExit(result.returncode)
