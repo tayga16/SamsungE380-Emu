@@ -1,0 +1,8 @@
+address,mode,label,kind,confidence
+0x20140be6,thumb,keypad_second_lookup_site,callsite,trace-backed
+0x208e51ac,thumb,keypad_irq16_handler,code,trace-backed
+0x2118bf80,thumb,keypad_irq_callback,code,trace-backed
+0x214d90c4,thumb,hkbd_common_queue,code,trace-backed
+0x215a61ce,thumb,hkbd_press_sender_site,callsite,trace-backed
+0x30031994,data,keypad_digit_1_record,data,trace-backed
+0x30031a44,data,keypad_up_record,data,trace-backed
