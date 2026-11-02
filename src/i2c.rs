@@ -27,6 +27,18 @@ const PCF5060X_REG_RTCWD: usize = 0x0d;
 const PCF5060X_REG_RTCDT: usize = 0x0e;
 const PCF5060X_REG_RTCMT: usize = 0x0f;
 const PCF5060X_REG_RTCYR: usize = 0x10;
+// E830 reset driver at 0x215f8d1c reads PMIC 0x2d and tests bit 1 before
+// touching the SIM serial controller. This is an external presence input,
+// not a firmware message or a writable card-in latch.
+const PCF5060X_REG_SIM_STATUS: usize = 0x2d;
+const PCF5060X_SIM_PRESENT: u8 = 1 << 1;
+const PCF5060X_REG_SIM_CONTROL: usize = 0x2c;
+const PCF5060X_SIM_ENABLE: u8 = 1 << 4;
+// E830 registers 1..4 are read-and-clear interrupt bytes, masks are 0x12..15.
+// The original reset driver registers bit 21 as activation completion. Keep
+// these separate from the legacy PMIC/RTC storage (whose full map is TODO).
+const SIM_ACTIVATED_EVENT: u32 = 1 << 21;
+const SIM_POWER_SEQUENCE_INSTRUCTIONS: u64 = 4096; // provisional, not physical time
 const PCF5060X_OOCS_BATOK: u8 = 1 << 3;
 const PCF5060X_OOCS_BACKOK: u8 = 1 << 4;
 const PCF5060X_OOCS_TEMPOK: u8 = 1 << 6;
@@ -46,6 +58,9 @@ struct Pcf5060x {
     registers: [u8; 256],
     pointer: u8,
     expect_pointer: bool,
+    sim_present: bool,
+    events: u32,
+    sim_power_deadline: Option<u64>,
 }
 
 impl Default for Pcf5060x {
@@ -68,31 +83,69 @@ impl Default for Pcf5060x {
             registers,
             pointer: 0,
             expect_pointer: true,
+            sim_present: false,
+            events: 0,
+            sim_power_deadline: None,
         }
     }
 }
 
 impl Pcf5060x {
+    fn next_deadline(&self) -> Option<u64> { self.sim_power_deadline }
+
     fn start(&mut self, direction: Direction) {
         if direction == Direction::Write {
             self.expect_pointer = true;
         }
     }
 
-    fn write(&mut self, value: u8) {
+    fn write(&mut self, value: u8, now: u64) {
         if self.expect_pointer {
             self.pointer = value;
             self.expect_pointer = false;
         } else {
-            self.registers[usize::from(self.pointer)] = value;
+            let register = usize::from(self.pointer);
+            let previous = self.registers[register];
+            // Interrupt status is device-owned in the experimental SIM model.
+            if !self.sim_present || !(1..=4).contains(&register) {
+                self.registers[register] = value;
+            }
+            if self.sim_present && register == PCF5060X_REG_SIM_CONTROL {
+                if value & PCF5060X_SIM_ENABLE == 0 {
+                    self.sim_power_deadline = None;
+                } else if previous & PCF5060X_SIM_ENABLE == 0 {
+                    self.sim_power_deadline = Some(now.saturating_add(SIM_POWER_SEQUENCE_INSTRUCTIONS));
+                }
+            }
             self.pointer = self.pointer.wrapping_add(1);
         }
     }
 
     fn read(&mut self) -> u8 {
-        let value = self.registers[usize::from(self.pointer)];
+        let mut value = self.registers[usize::from(self.pointer)];
+        if self.sim_present && (1..=4).contains(&self.pointer) {
+            let shift = u32::from(self.pointer - 1) * 8;
+            value = (self.events >> shift) as u8;
+            self.events &= !(0xff << shift);
+        }
+        if usize::from(self.pointer) == PCF5060X_REG_SIM_STATUS {
+            value = (value & !PCF5060X_SIM_PRESENT)
+                | if self.sim_present { PCF5060X_SIM_PRESENT } else { 0 };
+        }
         self.pointer = self.pointer.wrapping_add(1);
         value
+    }
+
+    fn advance(&mut self, now: u64) {
+        if self.sim_power_deadline.is_some_and(|deadline| now >= deadline) {
+            self.sim_power_deadline = None;
+            self.events |= SIM_ACTIVATED_EVENT;
+        }
+    }
+
+    fn irq_pending(&self) -> bool {
+        let masks = u32::from_le_bytes(self.registers[0x12..0x16].try_into().unwrap());
+        self.sim_present && self.events & !masks != 0
     }
 }
 
@@ -114,6 +167,36 @@ pub struct I2c {
 }
 
 impl I2c {
+    pub fn next_deadline(&self) -> Option<u64> {
+        match (self.deadline, self.pcf5060x.next_deadline()) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (left, right) => left.or(right),
+        }
+    }
+
+    /// Connect the physical card-presence input at power-on. No interrupt or
+    /// guest event is generated; the original PMIC driver must read it.
+    pub fn with_sim_present(present: bool) -> Self {
+        let mut bus = Self::default();
+        bus.pcf5060x.sim_present = present;
+        bus
+    }
+
+    /// PMIC IRQ_N is independent of the I2C master's own IRQ28.
+    pub fn pmic_irq_pending(&self) -> bool {
+        self.pcf5060x.irq_pending()
+    }
+
+    pub fn sim_model_enabled(&self) -> bool {
+        self.pcf5060x.sim_present
+    }
+
+    pub fn sim_powered(&self) -> bool {
+        self.pcf5060x.sim_present
+            && self.pcf5060x.registers[PCF5060X_REG_SIM_CONTROL] & PCF5060X_SIM_ENABLE != 0
+            && self.pcf5060x.sim_power_deadline.is_none()
+    }
+
     fn status(&self) -> u32 {
         self.flags | 0xc0
             | if self.rx_fifo.is_empty() { RX_EMPTY } else { 0 }
@@ -191,6 +274,7 @@ impl I2c {
 
     pub fn advance(&mut self, now: u64) {
         while let Some(deadline) = self.deadline.filter(|deadline| now >= *deadline) {
+            self.pcf5060x.advance(deadline);
             let Some(word) = self.tx_fifo.pop_front() else { self.deadline = None; break; };
             self.transmitted = self.transmitted.wrapping_add(1);
             if word & START != 0 {
@@ -215,7 +299,7 @@ impl I2c {
                 match self.direction {
                     Some(Direction::Write) => {
                         let value = word as u8;
-                        self.pcf5060x.write(value);
+                        self.pcf5060x.write(value, deadline);
                         if std::env::var_os("E830_TRACE_I2C").is_some() {
                             eprintln!(
                                 "[e830-i2c] write slave=0x{PCF5060X_ADDRESS:02x} value=0x{value:02x} stop={} insns={deadline}",
@@ -248,6 +332,7 @@ impl I2c {
             self.deadline = (!self.tx_fifo.is_empty())
                 .then(|| deadline.saturating_add(self.byte_period()));
         }
+        self.pcf5060x.advance(now);
     }
 }
 
@@ -335,5 +420,85 @@ mod tests {
             &pcf.registers[PCF5060X_REG_RTCSC..=PCF5060X_REG_RTCYR],
             &[0x53, 0x45, 0x13, 0x03, 0x18, 0x07, 0x07]
         );
+    }
+
+    #[test]
+    fn sim_presence_is_an_external_input_not_a_writable_status_bit() {
+        for present in [false, true] {
+            let mut bus = I2c::with_sim_present(present);
+            let pcf = &mut bus.pcf5060x;
+            for written in [0x00, 0x02, 0xa5, 0xff] {
+                pcf.start(Direction::Write);
+                pcf.write(PCF5060X_REG_SIM_STATUS as u8, 0);
+                pcf.write(written, 0);
+                pcf.start(Direction::Write);
+                pcf.write(PCF5060X_REG_SIM_STATUS as u8, 0);
+                pcf.start(Direction::Read);
+                assert_eq!(pcf.read(), (written & !2) | if present { 2 } else { 0 });
+                assert_eq!(pcf.pointer, 0x2e);
+                assert_eq!(pcf.read(), 0);
+            }
+            assert!(!bus.irq_pending());
+        }
+    }
+
+    #[test]
+    fn sim_presence_is_delivered_by_the_normal_i2c_receive_fifo() {
+        let mut bus = I2c::with_sim_present(true);
+        bus.write(0, u32::from(START | 0x12), 0);
+        bus.write(0, u32::from(STOP | 0x2d), 0);
+        bus.advance(10_000);
+        bus.write(4, DONE, 10_000);
+        bus.write(0, u32::from(START | 0x13), 10_000);
+        bus.write(0, u32::from(STOP), 10_000);
+        bus.advance(20_000);
+        assert_eq!(bus.read(0x18), 1);
+        assert_eq!(bus.read(0), 2);
+        assert_eq!(bus.read(0x18), 0);
+        assert_eq!(bus.read(4) & (DONE | NACK), DONE);
+    }
+
+    #[test]
+    fn sim_power_completion_is_delayed_masked_and_read_clear() {
+        let mut bus = I2c::with_sim_present(true);
+        let pcf = &mut bus.pcf5060x;
+        pcf.registers[0x14] = 0xff;
+        pcf.start(Direction::Write);
+        pcf.write(0x2c, 100);
+        pcf.write(0x1c, 100);
+        pcf.advance(100 + SIM_POWER_SEQUENCE_INSTRUCTIONS - 1);
+        assert_eq!(pcf.events, 0);
+        pcf.advance(100 + SIM_POWER_SEQUENCE_INSTRUCTIONS);
+        assert_eq!(pcf.events, SIM_ACTIVATED_EVENT);
+        assert!(!pcf.irq_pending());
+        pcf.registers[0x14] &= !0x20;
+        assert!(pcf.irq_pending());
+        pcf.pointer = 2;
+        assert_eq!(pcf.read(), 0);
+        assert!(pcf.irq_pending());
+        assert_eq!(pcf.read(), 0x20);
+        assert!(!pcf.irq_pending());
+        pcf.advance(u64::MAX);
+        assert_eq!(pcf.events, 0); // no duplicate event while still enabled
+        assert!(!bus.irq_pending()); // independent of master IRQ28
+    }
+
+    #[test]
+    fn sim_poweroff_cancels_sequence_and_absent_card_has_no_completion() {
+        for present in [false, true] {
+            let mut bus = I2c::with_sim_present(present);
+            let pcf = &mut bus.pcf5060x;
+            pcf.start(Direction::Write);
+            pcf.write(0x2c, 0);
+            pcf.write(0x1d, 0);
+            if present {
+                pcf.start(Direction::Write);
+                pcf.write(0x2c, 1);
+                pcf.write(0x0d, 1);
+            }
+            pcf.advance(u64::MAX);
+            assert_eq!(pcf.events, 0);
+            assert!(!pcf.irq_pending());
+        }
     }
 }

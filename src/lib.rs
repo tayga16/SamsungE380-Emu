@@ -156,6 +156,10 @@ fn validate_cla(cla: &[u8]) -> Result<u32, FirmwareError> {
 }
 
 mod machine;
+mod dsp_rf;
+mod analog_hle;
+mod keypad;
+pub use keypad::PhoneKey;
 
 pub use machine::{
     BootReport, E830Machine, MachineError, MemoryFault, MmioAccess, StopReason, LCD_HEIGHT,
@@ -218,6 +222,7 @@ mod tests {
 mod cpu;
 mod uart;
 mod i2c;
+mod sim;
 mod serial;
 mod onenand;
 

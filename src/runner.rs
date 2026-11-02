@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{atomic::{AtomicBool, Ordering}, mpsc::{self, Receiver}, Arc};
 use std::thread::JoinHandle;
@@ -5,6 +6,17 @@ use std::time::{Duration, Instant};
 
 use e830::{E830Machine, FirmwareSet, StopReason};
 use serde::{Deserialize, Serialize};
+
+// Keep the worker responsive to phone contacts. At the old 2M-instruction
+// quantum a batch can occupy the CPU thread for hundreds of milliseconds,
+// allowing a complete GUI click (down + up) to accumulate before the guest
+// gets another chance to service IRQ16.
+const NORMAL_RUN_QUANTUM: u64 = 2_000_000;
+// The post-animation UI path needs up to the same one-million-instruction
+// separation used by the successful late-key CLI probe. 250k was enough for
+// IRQ16/HKBD delivery, but could release a direction contact before the UI
+// task consumed its queued press message.
+const INPUT_RUN_QUANTUM: u64 = 1_000_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FirmwarePaths {
@@ -64,10 +76,28 @@ pub fn validate_nand_image(path: &Path) -> Result<(), String> {
 
 pub enum WorkerEvent {
     Frame(Vec<u8>),
+    InputApplied(String),
     Finished(String),
 }
 
+fn describe_key_transition(previous: u32, keys: u32) -> String {
+    let mut changes = Vec::new();
+    for key in e830::PhoneKey::ALL {
+        if (previous ^ keys) & key.bit() != 0 {
+            changes.push(format!("{key:?} {}", if keys & key.bit() != 0 { "down" } else { "up" }));
+        }
+    }
+    if changes.is_empty() { "no contact change".into() } else { changes.join(", ") }
+}
+
+fn input_history_suffix(history: &VecDeque<String>) -> String {
+    if history.is_empty() { String::new() } else {
+        format!("; recent input: {}", history.iter().cloned().collect::<Vec<_>>().join(" | "))
+    }
+}
+
 pub struct Worker {
+    input: mpsc::Sender<u32>,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
     pub events: Receiver<WorkerEvent>,
@@ -78,18 +108,45 @@ impl Worker {
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
         let (sender, events) = mpsc::channel();
+        let (input, worker_input) = mpsc::channel();
         let handle = std::thread::Builder::new().name("e830-firmware".into()).spawn(move || {
             // Unicorn owns Rc state and must be constructed inside this thread.
             let result = (|| -> anyhow::Result<String> {
                 let mut machine = E830Machine::new(paths.load()?, false)?;
-                let mut last_frame_count = 0;
+                let mut last_lcd_revision = 0;
                 let mut latest_frame = None;
                 let mut last_emit_at = Instant::now() - Duration::from_secs(1);
-                let mut last_report = None;
+                let mut last_report: Option<e830::BootReport> = None;
+                let mut last_keys = 0;
+                let mut input_history = VecDeque::with_capacity(8);
                 while !worker_stop.load(Ordering::Relaxed) {
-                    let report = machine.run(2_000_000)?;
-                    if report.lcd_frames > last_frame_count {
-                        last_frame_count = report.lcd_frames;
+                    // Apply at most one contact transition per guest quantum.
+                    // This preserves ordering while ensuring a queued release
+                    // cannot overtake the firmware's opportunity to service
+                    // the preceding press interrupt.
+                    let input_applied = if let Ok(keys) = worker_input.try_recv() {
+                        let instructions = last_report.as_ref().map_or(0, |report| report.instructions);
+                        let pc = last_report.as_ref().map_or(0, |report| report.pc);
+                        let entry = format!(
+                            "{} at {} (mask=0x{keys:06x}, PC=0x{pc:08x})",
+                            describe_key_transition(last_keys, keys), instructions,
+                        );
+                        machine.set_phone_keys(keys);
+                        last_keys = keys;
+                        if input_history.len() == 8 { input_history.pop_front(); }
+                        input_history.push_back(entry.clone());
+                        if sender.send(WorkerEvent::InputApplied(entry)).is_err() {
+                            return Ok("Window closed.".into());
+                        }
+                        true
+                    } else { false };
+                    let quantum = if input_applied { INPUT_RUN_QUANTUM } else { NORMAL_RUN_QUANTUM };
+                    let report = machine.run(quantum).map_err(|error| anyhow::anyhow!(
+                        "running guest: {error}{}", input_history_suffix(&input_history)
+                    ))?;
+                    let revision = machine.lcd_write_revision();
+                    if revision != last_lcd_revision {
+                        last_lcd_revision = revision;
                         latest_frame = machine.lcd_snapshot_rgb();
                     }
                     if last_emit_at.elapsed() >= Duration::from_millis(50) {
@@ -99,10 +156,12 @@ impl Worker {
                         }
                     }
                     if let Some(fault) = &report.memory_fault {
-                        anyhow::bail!("Guest memory fault: {} at 0x{:08x}, PC=0x{:08x}", fault.kind, fault.address, fault.pc);
+                        anyhow::bail!("Guest memory fault: {} at 0x{:08x}, PC=0x{:08x}{}",
+                            fault.kind, fault.address, fault.pc, input_history_suffix(&input_history));
                     }
                     if let StopReason::CpuError(error) = &report.stop_reason {
-                        anyhow::bail!("CPU stopped: {error}; PC=0x{:08x}", report.pc);
+                        anyhow::bail!("CPU stopped: {error}; PC=0x{:08x}; CPSR=0x{:08x}; SP=0x{:08x}; LR=0x{:08x}{}",
+                            report.pc, report.cpsr, report.sp, report.lr, input_history_suffix(&input_history));
                     }
                     last_report = Some(report);
                     std::thread::sleep(Duration::from_millis(1));
@@ -116,10 +175,13 @@ impl Worker {
             let summary = result.unwrap_or_else(|error| format!("E830 error: {error:#}"));
             let _ = sender.send(WorkerEvent::Finished(summary));
         })?;
-        Ok(Self { stop, handle: Some(handle), events })
+        Ok(Self { input, stop, handle: Some(handle), events })
     }
 
+    pub fn set_phone_keys(&self, keys: u32) { let _ = self.input.send(keys); }
+
     pub fn stop(&mut self) {
+        self.set_phone_keys(0);
         self.stop.store(true, Ordering::Relaxed);
         if let Some(handle) = self.handle.take() { let _ = handle.join(); }
     }
@@ -194,6 +256,27 @@ mod tests {
             // Only this test's uniquely created directory is removed.
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn input_channel_preserves_short_click_and_stop_releases_before_join() {
+        let (input, receive) = mpsc::channel();
+        let (_events, events) = mpsc::channel();
+        let mut worker = Worker { input, stop: Arc::new(AtomicBool::new(false)), handle: None, events };
+        worker.set_phone_keys(e830::PhoneKey::Ok.bit());
+        worker.set_phone_keys(0);
+        assert_eq!(receive.try_iter().collect::<Vec<_>>(), vec![e830::PhoneKey::Ok.bit(), 0]);
+        worker.stop();
+        assert_eq!(receive.try_recv().unwrap(), 0);
+        assert!(worker.stop.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn input_diagnostics_describe_press_and_release() {
+        let one = e830::PhoneKey::One.bit();
+        assert_eq!(describe_key_transition(0, one), "One down");
+        assert_eq!(describe_key_transition(one, 0), "One up");
+        assert_eq!(describe_key_transition(0, 0), "no contact change");
     }
 
     #[test]

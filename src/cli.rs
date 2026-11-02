@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use e830::{E830Machine, FirmwareSet, StopReason, LCD_HEIGHT, LCD_WIDTH};
+use e830::{E830Machine, FirmwareSet, PhoneKey, StopReason, LCD_HEIGHT, LCD_WIDTH};
 
 mod provision;
 
@@ -55,6 +55,22 @@ struct Args {
     /// Save DSP boot memory space 1 as little-endian 16-bit words
     #[arg(long)]
     dump_dsp_space1: Option<PathBuf>,
+    /// External phone contact transition: INSTRUCTION:KEY:down|up (repeatable)
+    #[arg(long, value_parser = parse_key_transition)]
+    key_at: Vec<KeyTransition>,
+}
+
+#[derive(Clone, Debug)]
+struct KeyTransition { at: u64, key: PhoneKey, down: bool }
+
+fn parse_key_transition(raw: &str) -> Result<KeyTransition, String> {
+    let parts: Vec<_> = raw.split(':').collect();
+    if parts.len() != 3 { return Err("Expected INSTRUCTION:KEY:down|up".into()); }
+    Ok(KeyTransition {
+        at: parts[0].parse::<u64>().map_err(|error| error.to_string())?,
+        key: PhoneKey::parse(parts[1]).ok_or_else(|| "Unknown phone key".to_string())?,
+        down: match parts[2] { "down" => true, "up" => false, _ => return Err("Use down or up".into()) },
+    })
 }
 
 fn parse_address(raw: &str) -> Result<u32, String> {
@@ -71,7 +87,29 @@ fn main() -> Result<()> {
     }
     let mut machine = E830Machine::new(firmware, args.trace_mmio)?;
     if let Some(pc) = args.break_at { machine.set_breakpoint(pc, args.break_after); }
-    let report = machine.run(args.max_instructions)?;
+    let mut transitions = args.key_at;
+    transitions.sort_by_key(|event| event.at);
+    anyhow::ensure!(transitions.iter().all(|event| event.at < args.max_instructions),
+        "key transition must precede max-instructions");
+    let mut keys = 0;
+    let mut executed = 0;
+    let mut stopped = None;
+    for event in transitions {
+        if event.at > executed {
+            let report = machine.run(event.at - executed)?;
+            executed = report.instructions;
+            if report.memory_fault.is_some() || report.stop_reason != StopReason::InstructionBudget {
+                stopped = Some(report); break;
+            }
+        }
+        if event.down { keys |= event.key.bit(); } else { keys &= !event.key.bit(); }
+        machine.set_phone_keys(keys);
+        println!("Phone contact at {executed}: {:?} {}", event.key, if event.down { "down" } else { "up" });
+    }
+    let report = match stopped {
+        Some(report) => report,
+        None => machine.run(args.max_instructions - executed)?,
+    };
     println!("{report:#?}");
     if let Some(path) = args.firmware_script {
         anyhow::ensure!(report.stop_reason == StopReason::Breakpoint && report.memory_fault.is_none(),
@@ -116,4 +154,21 @@ fn main() -> Result<()> {
     if let Some(fault) = report.memory_fault { anyhow::bail!("Guest memory fault: {fault:?}"); }
     if let StopReason::CpuError(error) = report.stop_reason { anyhow::bail!("CPU stopped: {error}"); }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn phone_transition_parser_rejects_ambiguous_or_invalid_input() {
+        let event = parse_key_transition("600000000:soft-left:down").unwrap();
+        assert_eq!(event.at, 600_000_000);
+        assert_eq!(event.key, PhoneKey::SoftLeft);
+        assert!(event.down);
+        assert!(!parse_key_transition("610000000:ok:up").unwrap().down);
+        for raw in ["ok", "1:unknown:down", "-1:ok:up", "1:ok:click", "1:ok:up:extra"] {
+            assert!(parse_key_transition(raw).is_err());
+        }
+    }
 }

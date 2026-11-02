@@ -24,6 +24,10 @@ command = [str(root / "target" / "release" / "e830-cli.exe"),
            str(root / "firmware" / "E830XEGG1.cla"),
            str(root / "firmware" / "E830 eeprom.nsf"),
            "--tfs", str(root / "firmware" / "E830XEGG1.tfs"), *arguments]
+for suffix in (".log", ".mmio"):
+    destination = output / f"{options.name}{suffix}"
+    if destination.exists():
+        parser.error(f"capture already exists: {destination}; choose a fresh name")
 with (output / f"{options.name}.log").open("wb") as stdout, \
         (output / f"{options.name}.mmio").open("wb") as stderr:
     started = time.perf_counter()

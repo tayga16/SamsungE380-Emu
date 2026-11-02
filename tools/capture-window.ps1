@@ -1,3 +1,4 @@
+param([string] $OutputPath, [string] $ExecutablePath)
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
 Add-Type @'
@@ -31,7 +32,9 @@ public static class E830WindowCapture {
 '@
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $packageRoot = Join-Path $projectRoot 'dist'
-$application = Start-Process -FilePath (Join-Path $packageRoot 'e830-emulator.exe') -ArgumentList '--run' -WorkingDirectory $packageRoot -WindowStyle Hidden -PassThru
+$executable = if ($ExecutablePath) { (Resolve-Path -LiteralPath $ExecutablePath).Path }
+    else { Join-Path $packageRoot 'e830-emulator.exe' }
+$application = Start-Process -FilePath $executable -ArgumentList '--run' -WorkingDirectory (Split-Path -Parent $executable) -WindowStyle Hidden -PassThru
 $window = [IntPtr]::Zero
 try {
     $deadline = [DateTime]::UtcNow.AddSeconds(15)
@@ -52,7 +55,8 @@ try {
     try {
         if (-not [E830WindowCapture]::PrintWindow($window, $dc, 2)) { throw 'PrintWindow failed.' }
     } finally { $graphics.ReleaseHdc($dc) }
-    $capturePath = Join-Path $projectRoot 'proof\native-windows\gui-current.png'
+    $capturePath = if ($OutputPath) { [System.IO.Path]::GetFullPath($OutputPath) }
+        else { Join-Path $projectRoot 'proof\native-windows\gui-current.png' }
     try { $bitmap.Save($capturePath, [System.Drawing.Imaging.ImageFormat]::Png) }
     finally { $graphics.Dispose(); $bitmap.Dispose() }
     Write-Output ('GUI verified, process ' + $application.Id + ', screenshot: ' + $capturePath)

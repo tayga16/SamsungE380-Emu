@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Rect, RichText, Sense, Vec2};
 use serde::{Deserialize, Serialize};
+use e830::PhoneKey;
 
 use crate::runner::{classify_firmware_files, validate_nand_image, FirmwarePaths, Worker, WorkerEvent};
 
@@ -33,6 +34,43 @@ impl Settings {
 #[derive(PartialEq)]
 enum Screen { Library, Settings, Run }
 
+#[derive(Clone, Copy, Default)]
+struct RuntimeMode {
+    sim: bool,
+    boot_hle: bool,
+    rf_hle: bool,
+    battery_hle: bool,
+}
+
+impl RuntimeMode {
+    fn from_environment() -> Self {
+        Self {
+            sim: std::env::var("E830_SIM_PRESENT").as_deref() == Ok("1"),
+            boot_hle: std::env::var_os("E830_DSP_BOOT_HLE").is_some(),
+            rf_hle: std::env::var("E830_DSP_RF_HLE").as_deref() == Ok("empty"),
+            battery_hle: std::env::var("E830_ANALOG_HLE").as_deref() == Ok("battery"),
+        }
+    }
+
+    fn label(self) -> String {
+        format!("Mode: {} | DSP boot HLE: {} | RF HLE: {} | Battery HLE: {}",
+            if self.sim { "experimental SIM" } else { "no SIM" },
+            if self.boot_hle { "on" } else { "off" },
+            if self.rf_hle { "empty air" } else { "off" },
+            if self.battery_hle { "3.7 V" } else { "off" })
+    }
+
+    fn notice(self) -> &'static str {
+        if self.sim {
+            "Experimental SIM boot is incomplete. Startup animation is not a verified SIM standby or app menu."
+        } else if self.boot_hle {
+            "No-SIM standby (Insert SIM / SOS) is verified with the installed TFS NAND. App-menu navigation is not verified."
+        } else {
+            "DSP boot HLE is off. Use Run-E830-NoSIM.cmd for the verified no-card boot path."
+        }
+    }
+}
+
 enum FileDialogEvent {
     Firmware(Result<FirmwarePaths, String>),
     Nand(Option<PathBuf>),
@@ -40,6 +78,7 @@ enum FileDialogEvent {
 
 pub struct E830Launcher {
     root: PathBuf,
+    runtime_mode: RuntimeMode,
     config: Settings,
     config_draft: Option<Settings>,
     screen: Screen,
@@ -52,6 +91,7 @@ pub struct E830Launcher {
     last_frame_texture: Option<egui::TextureHandle>,
     last_frame_status: Option<String>,
     frame_stats: FrameStats,
+    sent_keys: u32,
 }
 
 impl E830Launcher {
@@ -59,10 +99,11 @@ impl E830Launcher {
         if config.firmware.is_none() { config.firmware = FirmwarePaths::bundled(&root); }
         let (events_tx, events_rx) = mpsc::channel();
         Self {
-            root, config, config_draft: None, screen: Screen::Library,
+            root, runtime_mode: RuntimeMode::from_environment(), config, config_draft: None, screen: Screen::Library,
             worker: None, events_tx, events_rx, dialog_open: false, running: false,
             status: "Welcome to Samsung E830 Emulator.".into(),
             last_frame_texture: None, last_frame_status: None, frame_stats: FrameStats::default(),
+            sent_keys: 0,
         }
     }
 
@@ -79,6 +120,7 @@ impl E830Launcher {
     fn stop(&mut self) {
         if let Some(mut worker) = self.worker.take() { worker.stop(); }
         self.running = false;
+        self.sent_keys = 0;
     }
 
     fn spawn_e830_run(&mut self, paths: FirmwarePaths) {
@@ -176,6 +218,10 @@ impl E830Launcher {
             while let Ok(event) = worker.events.try_recv() {
                 match event {
                     WorkerEvent::Frame(rgb) => latest = Some(rgb),
+                    WorkerEvent::InputApplied(summary) => {
+                        self.status = format!("Input: {summary}");
+                        self.last_frame_status = Some(summary);
+                    }
                     WorkerEvent::Finished(summary) => finished = Some(summary),
                 }
             }
@@ -216,6 +262,8 @@ impl E830Launcher {
     }
 
     fn ui_library(&mut self, ui: &mut egui::Ui) {
+        self.ui_runtime_mode(ui);
+        ui.add_space(8.0);
         let Some(paths) = self.config.firmware.clone() else {
             ui.add_space(80.0);
             ui.vertical_centered(|ui| {
@@ -298,6 +346,7 @@ impl E830Launcher {
     fn ui_run(&mut self, ui: &mut egui::Ui) {
         ui.heading("Run output");
         ui.add_space(8.0);
+        self.ui_runtime_mode(ui);
         if self.running { ui.label("Running Samsung SGH-E830…"); }
         ui.add_space(8.0);
         ui.horizontal(|ui| {
@@ -310,12 +359,74 @@ impl E830Launcher {
         ui.horizontal_top(|ui| {
             self.ui_run_screen(ui);
             ui.add_space(12.0);
-            ui.label("Experimental phone firmware model; keypad input is not emulated yet.");
+            self.ui_phone_keys(ui);
         });
         ui.add_space(8.0);
         if let Some(status) = self.last_frame_status.as_ref() {
             ui.label(RichText::new(status).small().color(Color32::from_gray(170)));
         }
+    }
+
+    fn send_phone_keys(&mut self, keys: u32) {
+        if keys != self.sent_keys {
+            if let Some(worker) = &self.worker { worker.set_phone_keys(keys); }
+            self.sent_keys = keys;
+        }
+    }
+
+    fn ui_runtime_mode(&self, ui: &mut egui::Ui) {
+        ui.label(RichText::new(self.runtime_mode.label()).small());
+        let colour = if self.runtime_mode.sim { Color32::from_rgb(240, 190, 100) }
+            else { Color32::from_gray(170) };
+        ui.label(RichText::new(self.runtime_mode.notice()).small().color(colour));
+    }
+
+    fn ui_phone_keys(&mut self, ui: &mut egui::Ui) {
+        let keyboard = ui.input(|input| phone_keyboard_mask(input));
+        let focused = ui.input(|input| input.focused);
+        let mut mouse = 0;
+        let mut mouse_clicks = 0;
+        ui.vertical(|ui| {
+            ui.label("Phone keypad");
+            ui.add_enabled_ui(self.running && focused, |ui| {
+                egui::Grid::new("phone_keypad").spacing(Vec2::new(5.0, 5.0)).show(ui, |ui| {
+                    for row in [
+                        [("Left soft", PhoneKey::SoftLeft), ("Up", PhoneKey::Up), ("Right soft", PhoneKey::SoftRight)],
+                        [("Left", PhoneKey::Left), ("Call", PhoneKey::Ok), ("Right", PhoneKey::Right)],
+                        [("+", PhoneKey::Call), ("Down", PhoneKey::Down), ("−", PhoneKey::End)],
+                        [("1", PhoneKey::One), ("2 abc", PhoneKey::Two), ("3 def", PhoneKey::Three)],
+                        [("4 ghi", PhoneKey::Four), ("5 jkl", PhoneKey::Five), ("6 mno", PhoneKey::Six)],
+                        [("7 pqrs", PhoneKey::Seven), ("8 tuv", PhoneKey::Eight), ("9 wxyz", PhoneKey::Nine)],
+                        [("*", PhoneKey::Star), ("0", PhoneKey::Zero), ("#", PhoneKey::Hash)],
+                    ] {
+                        for (label, key) in row {
+                            let button = egui::Button::new(label).min_size(Vec2::new(72.0, 35.0))
+                                .selected(self.sent_keys & key.bit() != 0);
+                            let response = ui.add(button);
+                            // A click is reported on the release frame. Treating
+                            // `clicked_by` as a held contact delayed release by
+                            // another GUI frame while the guest kept running.
+                            if response.is_pointer_button_down_on() { mouse |= key.bit(); }
+                            if response.clicked_by(egui::PointerButton::Primary) {
+                                mouse_clicks |= key.bit();
+                            }
+                        }
+                        ui.end_row();
+                    }
+                });
+            });
+            ui.add_space(8.0);
+            ui.label(RichText::new("Arrows: navigate | Enter: Call\nF1/F2: soft keys | F3/F4: +/−\n0-9: digits | F5/F6: */#").small());
+            ui.label(RichText::new("Experimental hardware input.\nSIM/network support is incomplete.").small());
+        });
+        let keys = if self.running && focused { keyboard | mouse } else { 0 };
+        // A fast mouse press and release can both arrive between repaints, so
+        // `is_pointer_button_down_on` is never observed. Preserve that short
+        // click as an explicit down/up pair. A normally observed held contact
+        // has its bit in `sent_keys`, and therefore only takes the release path.
+        let click_pulse = missed_click_pulse(self.sent_keys, keys, mouse_clicks);
+        if click_pulse != 0 { self.send_phone_keys(keys | click_pulse); }
+        self.send_phone_keys(keys);
     }
 
     fn ui_run_screen(&mut self, ui: &mut egui::Ui) {
@@ -360,8 +471,34 @@ impl eframe::App for E830Launcher {
             Screen::Settings => self.ui_settings(ui),
             Screen::Run => self.ui_run(ui),
         });
+        if self.screen != Screen::Run || !self.running || !ctx.input(|input| input.focused) {
+            self.send_phone_keys(0);
+        }
         if self.running || self.dialog_open { ctx.request_repaint_after(Duration::from_millis(16)); }
     }
+}
+
+fn phone_keyboard_mask(input: &egui::InputState) -> u32 {
+    if !input.focused || input.modifiers.ctrl || input.modifiers.alt || input.modifiers.command { return 0; }
+    use egui::Key;
+    [
+        (Key::ArrowUp, PhoneKey::Up), (Key::ArrowDown, PhoneKey::Down),
+        (Key::ArrowLeft, PhoneKey::Left), (Key::ArrowRight, PhoneKey::Right),
+        (Key::Enter, PhoneKey::Ok), (Key::F1, PhoneKey::SoftLeft),
+        (Key::F2, PhoneKey::SoftRight), (Key::F3, PhoneKey::Call),
+        (Key::F4, PhoneKey::End), (Key::F5, PhoneKey::Star), (Key::F6, PhoneKey::Hash),
+        (Key::Num0, PhoneKey::Zero), (Key::Num1, PhoneKey::One),
+        (Key::Num2, PhoneKey::Two), (Key::Num3, PhoneKey::Three),
+        (Key::Num4, PhoneKey::Four), (Key::Num5, PhoneKey::Five),
+        (Key::Num6, PhoneKey::Six), (Key::Num7, PhoneKey::Seven),
+        (Key::Num8, PhoneKey::Eight), (Key::Num9, PhoneKey::Nine),
+    ].into_iter().fold(0, |mask, (key, phone)| {
+        mask | if input.key_down(key) || input.key_pressed(key) { phone.bit() } else { 0 }
+    })
+}
+
+fn missed_click_pulse(previous: u32, current: u32, clicks: u32) -> u32 {
+    clicks & !previous & !current
 }
 
 // The presentation statistics and overlay match the original desktop frontend.
@@ -407,6 +544,54 @@ mod tests {
             "firmware":{"cla":"test.cla","eeprom":"test.nsf","tfs":null,"onenand":"selected.bin"}
         }"#).unwrap();
         E830Launcher::new(std::env::temp_dir(), config)
+    }
+
+    #[test]
+    fn keyboard_contacts_include_short_taps_and_release_on_focus_loss() {
+        let ctx = egui::Context::default();
+        let event = |key, pressed| egui::Event::Key {
+            key, physical_key: None, pressed, repeat: false, modifiers: Default::default(),
+        };
+        let mut raw = egui::RawInput::default();
+        raw.events = vec![event(egui::Key::Num1, true), event(egui::Key::Num1, false),
+            event(egui::Key::ArrowUp, true)];
+        ctx.begin_frame(raw);
+        assert_eq!(ctx.input(phone_keyboard_mask), PhoneKey::One.bit() | PhoneKey::Up.bit());
+        let _ = ctx.end_frame();
+        ctx.begin_frame(egui::RawInput::default());
+        assert_eq!(ctx.input(phone_keyboard_mask), PhoneKey::Up.bit());
+        let _ = ctx.end_frame();
+        let mut raw = egui::RawInput::default();
+        raw.focused = false;
+        ctx.begin_frame(raw);
+        assert_eq!(ctx.input(phone_keyboard_mask), 0);
+        let _ = ctx.end_frame();
+    }
+
+    #[test]
+    fn fast_mouse_click_gets_a_pulse_but_normal_release_does_not_repeat() {
+        let up = PhoneKey::Up.bit();
+        assert_eq!(missed_click_pulse(0, 0, up), up);
+        assert_eq!(missed_click_pulse(0, up, up), 0);
+        assert_eq!(missed_click_pulse(up, 0, up), 0);
+        assert_eq!(missed_click_pulse(0, 0, 0), 0);
+    }
+
+    #[test]
+    fn runtime_mode_labels_do_not_claim_a_sim_menu_or_enable_hle() {
+        let plain = super::RuntimeMode::default();
+        assert!(plain.label().contains("no SIM"));
+        assert!(plain.label().contains("DSP boot HLE: off"));
+        assert!(plain.notice().contains("DSP boot HLE is off"));
+        let no_card = super::RuntimeMode { boot_hle: true, ..plain };
+        assert!(no_card.notice().contains("Insert SIM / SOS"));
+        assert!(no_card.notice().contains("App-menu navigation is not verified"));
+        let candidate = super::RuntimeMode { sim: true, rf_hle: true, battery_hle: true, ..no_card };
+        assert!(candidate.label().contains("experimental SIM"));
+        assert!(candidate.label().contains("empty air"));
+        assert!(candidate.label().contains("3.7 V"));
+        assert!(candidate.notice().contains("Experimental SIM boot is incomplete"));
+        assert!(candidate.notice().contains("not a verified SIM standby or app menu"));
     }
 
     #[test]
