@@ -340,6 +340,29 @@ Checklist for the emulator mapping:
 Therefore the emulated physical mapping is correct; the firmware itself
 normalizes it back. `keypad.rs` is not the source of the Up drop.
 
+## Release dispatch is fully mapped; the remaining unknown is the active profile
+
+HKBD message dispatch (two parallel arrays at `0x20a8e87c`, `msg -> handler`):
+
+| msg | handler | role |
+| ---: | ---: | --- |
+| `0x2201` / `0x2209` | `0x20d92134` / `0x20d9221c` | configuration apply |
+| `0x2208` | `0x20140bb4` | press processing (normalizes physical -> lookup) |
+| `0x2207` | `0x20140e9c` | release gate (requires slot 2/4) |
+| `0x2207` | `0x20989ebc` | periodic event class (auto-repeat family) |
+| `0x220c` | `0x20989eb8` | slot-clear / state reset |
+
+Both `0x2207` handlers are confirmed by the dispatch table; the release gate is
+the only path that produces `0x2204` for direction keys, and it requires the
+record's configuration slot to hold `2` or `4`. With the corrected physical
+mapping (Up `0x0108` -> normalized `0x28`, slot 20; Down `0x1810` -> `0x310`,
+slot 21) and the profile table above, no profile 2..20 leaves either slot in a
+release-valid state except profile 18 (slot 20 = 2). Static analysis therefore
+cannot explain a working Down on the current mapping; either the active menu
+screen installs profile 18, or an external clear/rewrite sequence changes the
+live slots. The runtime trace (already wired for `hkbd_record_*` +
+`hkbd_config_*`) decides between those two at menu entry.
+
 ## Static slot analysis of the profile 2..20 switch
 
 This section records what was learned without a build. The config builder at
