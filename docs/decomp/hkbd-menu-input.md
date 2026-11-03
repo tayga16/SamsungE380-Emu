@@ -387,32 +387,48 @@ profile 18 would leave it at the release-valid `2`. The remaining open item is
 still which profile the genuine menu screen installs, and whether any profile
 transition is lost between MMI and HKBD.
 
-## Root cause and exact call path
+## Root cause (runtime-confirmed, 2026-11-03)
 
-The active menu uses profile 3 for ordinary (non-special) numeric screens:
-`0x209adb30` selects the configuration, and when `[0x302e7503]==0` it calls
-`lk2_set_keyboard(3)` (via stub `0x208a7f00`). Profile body 3 executes through
-the fallback body `0x20157586`, which writes slot 20 (`config[20]`) with value
-`3`, leaving slot 21 (Down) at `0`.
-
-The two HKBD gates then both reject Up:
+Two HKBD gates decide whether a key ever produces `0x2204`, and they are *not*
+the same test:
 
 ```text
-press  (0x20140c68, type-0 records):  if config[slot] is 3 or 4 -> skip 0x2204
-release(0x20140e9c, type-0 records):  if config[slot] is not 2 or 4 -> reject
+press   0x20140c68..0x20140c9c   type 0/3:  if config[slot] is 3 or 4 -> NO 0x2204
+                                 otherwise, and if [0x301ce2bc]==0    -> send 0x2204
+release 0x20140e9c..0x20140efe   type 0:    only config[slot] 2 or 4 -> send 0x2204
 ```
 
-Up: type=0, slot 20, config[20]=3 -> blocked on both press and release.
-Down: type=0, slot 21, config[21]=0 -> passes the press gate (config 0 is
-allowed there) and only the release gate matters, which is why Down navigates.
-This exactly reproduces the reported "Up ignored, Down works" symptom.
+The late-menu RAM dump gives the decisive asymmetry:
 
-Confirmed at runtime: the `full-tfs-2k` boot-ram dump shows `config[20] = 3`,
-`config[21] = 0`, profile byte `0x3040067c = 1` (default), matching profile 3's
-write of slot 20 = 3. The fix must make the menu apply a profile that leaves
-`config[20]` at `2` (profile 18) without patching firmware or remapping events;
-e.g. correct delivery/application of the profile transition between MMI and
-HKBD so the active menu no longer lands on profile 3.
+| key | record | slot | config[slot] | press 0x2204 | release 0x2204 |
+| --- | --- | ---: | ---: | --- | --- |
+| Up | rec22 `0x0108` | 20 | **3** | blocked | blocked |
+| Down | rec21 `0x1810` | 21 | **0** | sent | rejected |
+
+So Down still navigates because the *press* path emits `0x2204` for it, while
+Up is rejected by both gates. That reproduces the reported symptom exactly
+without any remap, injected event or firmware patch.
+
+Where `config[20] = 3` comes from: the dump also shows the active profile byte
+`0x3040067c = 1`. In `lk2_set_keyboard` (`0x20156e80`) the jump table covers
+profiles 2..20; profile 1 falls through `cmp r2,#0x12 / bhs 0x20156f20` to the
+shared fallback body `0x20157586`, whose last builder call is
+`len=3, value=3, count=1, slot=0x14` - i.e. **config[20] = 3**. Profiles 10 and
+17 share that body; profile 15 writes slot 20 = 3 directly at `0x201573f2`.
+
+The profile selector `0x209adb30` (stub `0x208a7f00`) requests profile 1 in its
+last case `0x209adbae`, and its dispatch header `0x209adb00` sends *any* state
+index `>= 0xc` to that same case. Its other cases request profiles 2, 3 and 12
+based on `[0x302e7503]` (dump value 0) and on task-record fields read through
+`0x208a7174(0x8001)`.
+
+Therefore the remaining emulator-owned question is narrow and runtime-only: in
+the live menu, which selector case runs, and does the requested profile (plus
+its `0x3b68 -> 0x2201` delivery) actually reach HKBD before the key event. No
+static path writes slot 20 with the release-valid `2` except profile 18
+(`0x20157510`, builder call `value=2, count=11`, slots include `0x14`), and no
+profile writes slot 21 at all - which is consistent with Down working through
+the press path rather than the release path.
 
 ## Static slot analysis of the profile 2..20 switch
 
