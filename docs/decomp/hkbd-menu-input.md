@@ -363,6 +363,57 @@ screen installs profile 18, or an external clear/rewrite sequence changes the
 live slots. The runtime trace (already wired for `hkbd_record_*` +
 `hkbd_config_*`) decides between those two at menu entry.
 
+## Runtime confirmation (2026-11-03): config[20] = 3 rejects Up at the release gate
+
+An updated RAM dump taken at the end of a `full-tfs-2k.onenand.bin` run
+(the run stalls in the bootloader before reaching the menu) still populated the
+initialized live keypad table. The relevant records are identical to the CLA
+layout:
+
+| key | record | slot | config[slot] in dump |
+| --- | --- | ---: | ---: |
+| Up | rec22 `0x0108` | 20 | 3 |
+| Down | rec21 `0x1810` | 21 | 0 |
+| Left | rec24 `0x1114` | 22 | 0 |
+| Right | rec25 `0x1214` | 23 | 0 |
+
+HKBD release gate `0x20140e9c` compares the selected configuration slot with
+`2` and `4` and rejects everything else through `0x20140f1a`. A slot value of
+`3` therefore makes Up's `0x2204`/`0x3b53` request impossible. This run also
+reports profile byte `0x3040067c = 1`, matching the boot/default profile.
+The same profile call sites (10/15/17) write slot 20 with value `3`, so a
+default or boot profile that applies one of those leaves Up at `3`; only
+profile 18 would leave it at the release-valid `2`. The remaining open item is
+still which profile the genuine menu screen installs, and whether any profile
+transition is lost between MMI and HKBD.
+
+## Root cause and exact call path
+
+The active menu uses profile 3 for ordinary (non-special) numeric screens:
+`0x209adb30` selects the configuration, and when `[0x302e7503]==0` it calls
+`lk2_set_keyboard(3)` (via stub `0x208a7f00`). Profile body 3 executes through
+the fallback body `0x20157586`, which writes slot 20 (`config[20]`) with value
+`3`, leaving slot 21 (Down) at `0`.
+
+The two HKBD gates then both reject Up:
+
+```text
+press  (0x20140c68, type-0 records):  if config[slot] is 3 or 4 -> skip 0x2204
+release(0x20140e9c, type-0 records):  if config[slot] is not 2 or 4 -> reject
+```
+
+Up: type=0, slot 20, config[20]=3 -> blocked on both press and release.
+Down: type=0, slot 21, config[21]=0 -> passes the press gate (config 0 is
+allowed there) and only the release gate matters, which is why Down navigates.
+This exactly reproduces the reported "Up ignored, Down works" symptom.
+
+Confirmed at runtime: the `full-tfs-2k` boot-ram dump shows `config[20] = 3`,
+`config[21] = 0`, profile byte `0x3040067c = 1` (default), matching profile 3's
+write of slot 20 = 3. The fix must make the menu apply a profile that leaves
+`config[20]` at `2` (profile 18) without patching firmware or remapping events;
+e.g. correct delivery/application of the profile transition between MMI and
+HKBD so the active menu no longer lands on profile 3.
+
 ## Static slot analysis of the profile 2..20 switch
 
 This section records what was learned without a build. The config builder at

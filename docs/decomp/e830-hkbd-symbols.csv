@@ -85,3 +85,5 @@ address,mode,label,kind,confidence
 0x20a8e87c,data,hkbd_message_dispatch_table,data,static-verified
 0x20989ebc,thumb,hkbd_periodic_event_class,code,static
 0x2118bf80,thumb,hkbd_keypad_callback,code,static
+0x209adb30,thumb,mmi_select_profile_ordinary_numeric,code,static
+0x302e7503,data,mmi_ordinary_numeric_flag,data,static
