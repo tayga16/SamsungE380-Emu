@@ -77,3 +77,8 @@ address,mode,label,kind,confidence
 0x2015733c,thumb,mml_keyboard_profile_15_body,code,static
 0x20157510,thumb,mml_keyboard_profile_18_body,code,static
 0x2015b136,thumb,mml_keyboard_profile_20_body,code,static
+0x20140bb4,thumb,hkbd_normalize_physical_key,code,static-verified
+0x2118be80,thumb,hkbd_live_record_lookup_normalized,code,static-verified
+0x215a602c,thumb,hkbd_key_event_class_handler,code,static
+0x209adb30,thumb,mmi_select_profile_by_state,code,static
+0x208a7f00,thumb,stub_lk2_set_keyboard,code,static-stub

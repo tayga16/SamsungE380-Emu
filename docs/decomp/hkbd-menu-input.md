@@ -321,6 +321,25 @@ Do not patch the firmware, force an MMI message, seed saved-message state or rem
 `0x14`. Fix only the emulator-owned condition that the paired traces prove is
 wrong.
 
+## Physical-key normalization and live lookup
+
+The inbound physical word is not used directly. `0x20140bb4` computes
+`normalized = (phys & 0xff) | ((phys >> 3) & 0x1fe0)` and stores it at
+`0x301ce2f4+4`; `0x2118be80` then searches the live record table at
+`0x30031994` for a record whose first halfword equals that normalized value.
+Checklist for the emulator mapping:
+
+| key | physical (CLA) | normalized | emulator keypad.rs |
+| --- | ---: | ---: | ---: |
+| Up | `0x0108` | `0x28` | (8,1) -> `0x28` |
+| Down | `0x1810` | `0x310` | (16,24) -> `0x310` |
+| Left | `0x1114` | `0x234` | (20,17) -> `0x234` |
+| Right | `0x1214` | `0x254` | (20,18) -> `0x254` |
+| 1 | `0x0801` | `0x101` | (1,8) -> `0x101` |
+
+Therefore the emulated physical mapping is correct; the firmware itself
+normalizes it back. `keypad.rs` is not the source of the Up drop.
+
 ## Static slot analysis of the profile 2..20 switch
 
 This section records what was learned without a build. The config builder at
@@ -364,35 +383,38 @@ were decoded from the jump table at `0x20156f24`. Payloads below list
 | profile | payload groups |
 | ---: | --- |
 | 2 | `0 -> 14,15,6,7,3,11,12`; `2 -> 4,5,18,19`; `3 -> 2` |
-| 3 | `0 -> 14,15,6,7,3,11,12`; `2 -> r6,5,18,19`; `3 -> 2` |
+| 3 | `0 -> 14,15,6,7,3,11,12`; `2 -> 4,5,18,19`; `3 -> 2` |
 | 4 | `1 -> 4,11,12`; `0 -> 18,19`; `3 -> 6,7` |
 | 5 | `1 -> 5,11,12`; `3 -> 18,19` |
-| 6 | `1 -> 4,11,12`; `0 -> 18,19`; `2 -> r6,5` |
-| 7 | `2 -> r6,5,18,19` |
-| 8 | `2 -> r6,5` |
-| 9 | `2 -> r6,5,18,19` |
+| 6 | `1 -> 4,11,12`; `0 -> 18,19`; `2 -> 4,5` |
+| 7 | `2 -> 4,5,18,19` |
+| 8 | `2 -> 4,5` |
+| 9 | `2 -> 4,5,18,19` |
 | 10 | `0 -> 14,15,6,7,5,11,12,18,19,3,13,4`; `3 -> 20` |
-| 11 | `0 -> 14,15,6,7,3,11,12`; `2 -> r6,5,18,19`; `3 -> 2` |
+| 11 | `0 -> 14,15,6,7,3,11,12`; `2 -> 4,5,18,19`; `3 -> 2` |
 | 12 | `0 -> 14,15,6,7,3,11,12`; `2 -> 6,7`; `3 -> 2` |
-| 13 | `0 -> 14,15,6,7,3,11,12`; `2 -> r6,5`; `3 -> 2` |
-| 14 | `0 -> 14,15,6,7`; `3 -> r6,5,6,7,18` |
-| 15 | `0 -> 14,15,6,7`; `1 -> 18,19`; `2 -> 6,7`; `3 -> 20,2`; `1 -> r6,5` |
-| 16 | `0 -> 14,15,6,7,3,11,12`; `4 -> 6,7`; `3 -> 2`; `0 -> r6,5` |
+| 13 | `0 -> 14,15,6,7,3,11,12`; `2 -> 4,5`; `3 -> 2` |
+| 14 | `0 -> 14,15,6,7`; `3 -> 4,5,6,7,18` |
+| 15 | `0 -> 14,15,6,7`; `1 -> 18,19`; `2 -> 6,7`; `3 -> 20,2`; `1 -> 4,5` |
+| 16 | `0 -> 14,15,6,7,3,11,12`; `4 -> 6,7`; `3 -> 2`; `0 -> 4,5` |
 | 17 | same as 10 |
 | 18 | `0 -> 14,15`; `2 -> 6,7,4,5,18,19,3,11,12,13,20`; `3 -> 2` |
 | 19 | `0 -> 14,15,6,7,3,11,12`; `2 -> 18,19`; `3 -> 6,7` |
 | 20 | separate large routine `0x2015b136`, no config-builder calls |
 
 Only profile 18 writes slot 20 (Up) with the release-valid value `2`. No
-profile writes slot 21 (Down) with `2/4`. That is inconsistent with the
-working-Down symptom if the active menu really runs on one of these profiles,
-which means the static table alone cannot be the final word: the runtime trace
-must report which profile is active and the real `0x301ce2c8[20]/[21]` values
-at menu entry. If the trace shows profile 2/4/5 active in the menu while a
-release-valid Down slot is set by some later code, the emulator-owned failure
-is the missing/incorrect profile transition; if it shows a profile-18-style
-config that is later cleared, the failure is an HKBD `0x220c`-style clear or a
-`0x2201` delivery/scheduling problem.
+profile writes slot 21 (Down) with `2/4`. Earlier "working Down" runs
+predate the corrected physical-key map: they used the secondary record with
+key `0x12` (slot 18, physical `0x0208`) which profile 2 configures, not the
+cluster Down `0x15` (slot 21, physical `0x1810`). On the current physical
+mapping every direction key on profiles 2..20 is therefore release-gated
+unless the active profile is 18 (slot 20) or an external clear/rewrite
+sequence changes `0x301ce2c8[20]/[21]`. The runtime trace reports the active
+profile and the real `0x301ce2c8[20]/[21]` values at menu entry (already
+sampled as `hkbd_config_index`/`hkbd_config_value`). If it shows profile
+2/4/5 active, the emulator-owned failure is the missing/incorrect profile
+transition; if it shows a profile-18-style config that is later cleared, the
+failure is an HKBD slot-clear or a `0x2201` delivery/scheduling problem.
 
 Additional static anchors found while testing that hypothesis:
 
