@@ -171,6 +171,69 @@ const MAX_RECENT_MMIO: usize = 64;
 const KEYBOARD_INIT_TABLE: u32 = 0x20e8_2eac;
 const STANDBY_LOOK_TABLE: u32 = 0x2171_7f98;
 const STATE_TABLE_DISPATCH_PC: u64 = 0x2084_78f2;
+const MENU_INPUT_KEY_BLOCK_CANDIDATE: u64 = 0x3048_c264;
+const MENU_INPUT_TRACE_PCS: [u64; 60] = [
+    0x215a_6236, // HKBD sends MOBI_HKBD_KEY_PRESSED_IND to EDP.
+    0x20d7_5404, // EDP key-press pipe entry.
+    0x20d7_547c, // EDP direct APPI_EDP_KEY_PRESSED_IND route.
+    0x20d7_54da, // EDP alternate/editor route.
+    0x20d7_6304, // EDP keyboard-event diffusion entry.
+    0x2055_9318, // edp2_51NoDiffAppiMessages cross-build candidate.
+    0x2055_933a, // The no-diff predicate returns true.
+    0x2055_933e, // The no-diff predicate returns false.
+    0x20d7_631e, // Diffusion has the no-diff predicate result in r0.
+    0x20d7_632a, // Proven early free/return gate inside diffusion.
+    0x20d7_6334, // No-diff special route when the key-block gate is clear.
+    0x20d7_634e, // Diffusion continues toward the MMI recipient.
+    0x2015_6b34, // a_lk_StandbyLook wildcard callback.
+    0x2119_fe50, // lk1_1rout_fsm equivalent entered through the standby callback.
+    0x2015_6e80, // lk2_set_keyboard equivalent; requested profile is in r0.
+    0x2015_6eda, // First APPI_EDP_CHANGE_KBD_CONFIG_REQ send site.
+    0x2015_6f72, // Per-profile APPI_EDP_CHANGE_KBD_CONFIG_REQ send site.
+    0x2015_741a, // Late per-profile APPI_EDP_CHANGE_KBD_CONFIG_REQ send site.
+    0x2015_708c, // Keyboard profile 4 branch entry.
+    0x2015_70e6, // Keyboard profile 5 branch entry.
+    0x215a_5fc0, // HKBD key-record lookup over the RAM table at 0x30031994.
+    0x2158_2028, // EDP receives APPI_EDP_CHANGE_KBD_CONFIG_REQ.
+    0x2158_2042, // EDP forwards MOBI_HKBD_CONFIG_REQ to HKBD.
+    0x20d9_221c, // HKBD receives MOBI_HKBD_CONFIG_REQ and begins applying slots.
+    0x20d9_225a, // HKBD has applied every configuration slot in the request.
+    0x2014_0c1e, // HKBD compares one mailbox count before sending 0x2203.
+    0x2014_0c3e, // HKBD decides whether all press-path mailbox checks passed.
+    0x2014_0e9c, // HKBD release/short processing that can emit 0x2204.
+    0x2014_0ea6, // HKBD compares the active key-record type.
+    0x2014_0ebe, // HKBD compares the selected configuration-slot value.
+    0x2014_0ec4, // Active key record/configuration is eligible for 0x2204.
+    0x2014_0edc, // HKBD compares one mailbox count with its configured maximum.
+    0x2014_0ef0, // HKBD decides whether all three mailbox checks passed.
+    0x2014_0efe, // HKBD emits MOBI_HKBD_KEY_INFO_IND.
+    0x2014_0f1a, // Active key record/configuration rejected the 0x2204 path.
+    0x215a_6266, // Generic HKBD sender queues the completed 0x2204 payload to EDP.
+    0x2055_79b8, // EDP consumes MOBI_HKBD_KEY_INFO_IND.
+    0x2055_85e4, // EDP builds APPI_EDP_KEY_INFO_IND.
+    0x2055_864c, // EDP forwards APPI_EDP_KEY_INFO_IND to MMI.
+    0x211a_08b6, // MMI has loaded the APPI_EDP_KEY_PRESSED_IND payload.
+    0x211a_27e6, // MMI direction-key branch inside KEY_PRESSED handling.
+    0x211a_57c0, // lk2_33key_in_filter equivalent entry.
+    0x211a_593a, // Up (0x14) filter branch.
+    0x211a_599e, // Keyboard filter result in r0.
+    0x200d_4cc4, // MCC_GETKEY_ACCEPT_REJECT installs masks/profile.
+    0x2111_2a6c, // MCC_GETKEY_S installs mask A from its active descriptor.
+    0x2153_656c, // MCC_GETKEY_INCALL installs mask A from its active descriptor.
+    0x200d_4d94, // MCC_GETKEY_ACCEPT_REJECT_S calls the key filter.
+    0x200d_4d9c, // MCC_GETKEY_ACCEPT_REJECT_S tests the result.
+    0x200d_4dcc, // MCC_GETKEY_ACCEPT_REJECT_S rejected-key path.
+    0x2111_2b84, // MCC_GETKEY_S calls the shared key filter.
+    0x2111_2b8c, // MCC_GETKEY_S tests the filter result.
+    0x2153_66a0, // MCC_GETKEY_INCALL_S calls the shared key filter.
+    0x2153_66a8, // MCC_GETKEY_INCALL_S tests the filter result.
+    0x2111_2b96, // MCC_GETKEY_S forwards an accepted key to UI dispatch.
+    0x215b_8a30, // UI dispatch selects the Up (0x14) command.
+    0x2159_dd48, // Common UI command dispatcher entry; command in r0.
+    0x2159_dd60, // Common UI command dispatcher early return.
+    0x2159_de34, // Common UI command dispatcher invokes the selected action.
+    0x2159_defe, // Alternate common UI action invocation.
+];
 const RTOS_TASK_TRACE_PCS: [u64; 9] = [
     0x2084_7660, // receive: task group in r7, request in r5
     0x2084_7686, // event-mask wait has been stored in current task
@@ -197,6 +260,326 @@ fn diagnostic_ram_read(uc: &Unicorn<'_, E830State>, address: u64, size: usize) -
         return None;
     }
     uc.mem_read_as_vec(address, size).ok()
+}
+
+// Static MCFN descriptors live in the immutable CLA mapping, while their
+// command objects live in RAM. Keep this helper away from external flash and
+// every MMIO window; an unsuccessful read simply produces no diagnostic data.
+fn diagnostic_code_or_ram_read(
+    uc: &Unicorn<'_, E830State>,
+    address: u64,
+    size: usize,
+) -> Option<Vec<u8>> {
+    let end = address.checked_add(size as u64)?;
+    let in_ram = address >= u64::from(RAM_BASE)
+        && end <= u64::from(RAM_BASE) + RAM_SIZE as u64;
+    let in_cla = address >= u64::from(FLASH_BASE) && end <= EXTERNAL_FLASH_WINDOW_BASE;
+    (in_ram || in_cla).then(|| uc.mem_read_as_vec(address, size).ok()).flatten()
+}
+
+fn diagnostic_ram_u32(uc: &Unicorn<'_, E830State>, address: u64) -> Option<u32> {
+    diagnostic_ram_read(uc, address, 4)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u32::from_le_bytes)
+}
+
+fn diagnostic_ram_u8(uc: &Unicorn<'_, E830State>, address: u64) -> Option<u8> {
+    diagnostic_ram_read(uc, address, 1).and_then(|bytes| bytes.first().copied())
+}
+
+fn diagnostic_ram_u16(uc: &Unicorn<'_, E830State>, address: u64) -> Option<u16> {
+    diagnostic_ram_read(uc, address, 2)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u16::from_le_bytes)
+}
+
+fn menu_input_stage(address: u64) -> &'static str {
+    match address {
+        0x215a_6236 => "hkbd-to-edp",
+        0x20d7_5404 => "edp-pipe-entry",
+        0x20d7_547c => "edp-direct-route",
+        0x20d7_54da => "edp-alternate-route",
+        0x20d7_6304 => "edp-diffuse-entry",
+        0x2055_9318 => "edp-no-diff-predicate",
+        0x2055_933a => "edp-no-diff-true",
+        0x2055_933e => "edp-no-diff-false",
+        0x20d7_631e => "edp-diffuse-predicate-result",
+        0x20d7_632a => "edp-diffuse-drop",
+        0x20d7_6334 => "edp-diffuse-special-route",
+        0x20d7_634e => "edp-diffuse-forward",
+        0x2015_6b34 => "mmi-standby-entry",
+        0x2119_fe50 => "mmi-root-router",
+        0x2015_6e80 => "mmi-set-keyboard",
+        0x2015_6eda => "mmi-kbd-config-send-initial",
+        0x2015_6f72 => "mmi-kbd-config-send-profile",
+        0x2015_741a => "mmi-kbd-config-send-late-profile",
+        0x2015_708c => "mmi-keyboard-profile-4",
+        0x2015_70e6 => "mmi-keyboard-profile-5",
+        0x215a_5fc0 => "hkbd-key-record-lookup",
+        0x2158_2028 => "edp-kbd-config-receive",
+        0x2158_2042 => "edp-to-hkbd-config",
+        0x20d9_221c => "hkbd-config-receive",
+        0x20d9_225a => "hkbd-config-applied",
+        0x2014_0c1e => "hkbd-press-mailbox-count-compare",
+        0x2014_0c3e => "hkbd-press-mailbox-count-decision",
+        0x2014_0e9c => "hkbd-key-info-processing",
+        0x2014_0ea6 => "hkbd-key-info-record-type",
+        0x2014_0ebe => "hkbd-key-info-config-value",
+        0x2014_0ec4 => "hkbd-key-info-config-accepted",
+        0x2014_0edc => "hkbd-mailbox-count-compare",
+        0x2014_0ef0 => "hkbd-mailbox-count-decision",
+        0x2014_0efe => "hkbd-key-info-send",
+        0x2014_0f1a => "hkbd-key-info-config-rejected",
+        0x215a_6266 => "hkbd-key-info-to-edp",
+        0x2055_79b8 => "edp-key-info-entry",
+        0x2055_85e4 => "edp-key-info-build",
+        0x2055_864c => "edp-key-info-forward",
+        0x211a_08b6 => "mmi-key-pressed-consumer",
+        0x211a_27e6 => "mmi-key-pressed-direction",
+        0x211a_57c0 => "mmi-key-filter-entry",
+        0x211a_593a => "mmi-key-filter-up",
+        0x211a_599e => "mmi-key-filter-result",
+        0x200d_4cc4 => "mcc-getkey-accept-reject-config",
+        0x2111_2a6c => "mcc-getkey-s-config",
+        0x2153_656c => "mcc-getkey-incall-config",
+        0x200d_4d94 => "mcc-getkey-accept-reject-s-filter-call",
+        0x200d_4d9c => "mcc-getkey-accept-reject-s-filter-decision",
+        0x200d_4dcc => "mcc-getkey-accept-reject-s-rejected",
+        0x2111_2b84 => "mcc-getkey-s-filter-call",
+        0x2111_2b8c => "mcc-getkey-s-filter-decision",
+        0x2153_66a0 => "mcc-getkey-incall-s-filter-call",
+        0x2153_66a8 => "mcc-getkey-incall-s-filter-decision",
+        0x2111_2b96 => "mcc-getkey-s-ui-dispatch",
+        0x215b_8a30 => "ui-dispatch-up",
+        0x2159_dd48 => "ui-command-entry",
+        0x2159_dd60 => "ui-command-early-return",
+        0x2159_de34 => "ui-command-action",
+        0x2159_defe => "ui-command-action-alternate",
+        _ => "unknown",
+    }
+}
+
+fn diagnostic_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn key_filter_caller(lr: u32) -> &'static str {
+    match lr & !1 {
+        0x200d_4d98 => "mcc-getkey-accept-reject-s",
+        0x2111_2b88 => "mcc-getkey-s",
+        0x2153_66a4 => "mcc-getkey-incall-s",
+        _ => "other",
+    }
+}
+
+fn key_filter_context(lr: u32, r4: u32, r5: u32, r6: u32) -> u32 {
+    match lr & !1 {
+        0x200d_4d98 => r6,
+        0x2111_2b88 => r4,
+        0x2153_66a4 => r5,
+        _ => 0,
+    }
+}
+
+fn trace_menu_input_stage(uc: &mut Unicorn<'_, E830State>, address: u64, total: u64) {
+    let enabled = {
+        let state = uc.get_data();
+        state.trace_menu_input
+            && total >= state.trace_menu_input_after
+            && state.trace_menu_input_remaining > 0
+            && MENU_INPUT_TRACE_PCS.contains(&address)
+    };
+    if !enabled { return; }
+
+    let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+    let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+    let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+    let r3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+    let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+    let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+    let r6 = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
+    let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+    let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+
+    let object = match address {
+        0x215a_6236 | 0x215a_6266 => r3,
+        0x20d7_5404 | 0x2015_6b34 => r0,
+        0x20d7_547c | 0x20d7_54da | 0x20d7_631e | 0x20d7_632a
+        | 0x20d7_6334 | 0x20d7_634e => r5,
+        0x20d7_6304 => r1,
+        0x2015_6eda | 0x2015_6f72 | 0x2015_741a | 0x2158_2042 => r3,
+        0x2015_708c | 0x2015_70e6 | 0x215a_5fc0 => r0,
+        0x2158_2028 | 0x20d9_221c => r0,
+        0x20d9_225a => r5,
+        0x2055_79b8 | 0x2055_85e4 => r0,
+        0x2055_864c => r1,
+        0x211a_08b6 | 0x211a_27e6 => r4,
+        0x211a_57c0 => key_filter_context(lr, r4, r5, r6),
+        0x200d_4cc4 | 0x2111_2a6c | 0x2153_656c => r0,
+        _ => 0,
+    };
+    let object_bytes = if object == 0 {
+        "-".into()
+    } else {
+        diagnostic_ram_read(uc, u64::from(object), 0x1c)
+            .map(|bytes| diagnostic_hex(&bytes))
+            .unwrap_or_else(|| "unreadable".into())
+    };
+    let indirect = if matches!(address, 0x20d7_5404 | 0x2015_6b34 | 0x2055_79b8 | 0x2055_85e4 | 0x200d_4cc4 | 0x2111_2a6c | 0x2153_656c | 0x20d9_221c) {
+        diagnostic_ram_u32(uc, u64::from(object))
+            .and_then(|pointer| diagnostic_code_or_ram_read(uc, u64::from(pointer), 0x20)
+                .map(|bytes| format!("{pointer:08x}:{}", diagnostic_hex(&bytes))))
+            .unwrap_or_else(|| "-".into())
+    } else {
+        "-".into()
+    };
+    let keyboard_profile = diagnostic_ram_u8(uc, 0x3040_067c).unwrap_or(u8::MAX);
+    let pending_message = diagnostic_ram_u32(uc, 0x3001_4df4).unwrap_or(u32::MAX);
+    let filter_key = match address {
+        0x211a_57c0 | 0x200d_4d94 | 0x2111_2b84 | 0x2153_66a0 => r0,
+        0x211a_593a => 0x14,
+        _ => u32::MAX,
+    };
+    let filter_key_info = if matches!(
+        address,
+        0x211a_57c0 | 0x211a_593a | 0x211a_599e
+            | 0x200d_4d94 | 0x2111_2b84 | 0x2153_66a0
+    ) {
+        r1
+    } else {
+        u32::MAX
+    };
+    let (filter_mask_a, filter_mask_b, filter_key_offset) = match address {
+        0x211a_57c0 | 0x200d_4d94 | 0x2111_2b84 | 0x2153_66a0 => (
+            r2,
+            r3,
+            diagnostic_ram_u32(uc, u64::from(sp)).unwrap_or(u32::MAX),
+        ),
+        0x211a_593a | 0x211a_599e => (r2, r6, r5),
+        _ => (u32::MAX, u32::MAX, u32::MAX),
+    };
+    let filter_result = if matches!(address, 0x211a_599e | 0x200d_4d9c | 0x2111_2b8c | 0x2153_66a8) {
+        r0
+    } else {
+        u32::MAX
+    };
+    let up_allowed_a = if filter_mask_a != u32::MAX {
+        (filter_mask_a >> 17) & 1
+    } else {
+        u32::MAX
+    };
+    let up_allowed_b = if filter_mask_b != u32::MAX {
+        (filter_mask_b >> 17) & 1
+    } else {
+        u32::MAX
+    };
+    let lk_state = diagnostic_ram_read(uc, 0x3036_c108, 0x20)
+        .map(|bytes| diagnostic_hex(&bytes)).unwrap_or_else(|| "?".into());
+    let gate = diagnostic_ram_u8(uc, MENU_INPUT_KEY_BLOCK_CANDIDATE).unwrap_or(u8::MAX);
+    let gate_context = diagnostic_ram_read(uc, 0x3048_5708, 4)
+        .map(|bytes| diagnostic_hex(&bytes)).unwrap_or_else(|| "?".into());
+    let editor_mode = diagnostic_ram_u8(uc, 0x302e_7540).unwrap_or(u8::MAX);
+    let editor_gate = diagnostic_ram_u8(uc, 0x302e_74e8).unwrap_or(u8::MAX);
+    let pipe_gate = diagnostic_ram_u8(uc, 0x3001_4df1).unwrap_or(u8::MAX);
+    let hkbd_config = diagnostic_ram_read(uc, 0x301c_e2c8, 0x1b)
+        .map(|bytes| diagnostic_hex(&bytes)).unwrap_or_else(|| "?".into());
+    let hkbd_active = diagnostic_ram_read(uc, 0x301c_e2f4, 0x10)
+        .map(|bytes| diagnostic_hex(&bytes)).unwrap_or_else(|| "?".into());
+    let hkbd_key_record = diagnostic_ram_u32(uc, 0x301c_e2fc)
+        .map(|record| {
+            let bytes = diagnostic_ram_read(uc, u64::from(record), 8)
+                .map(|bytes| diagnostic_hex(&bytes)).unwrap_or_else(|| "?".into());
+            format!("{record:08x}:{bytes}")
+        }).unwrap_or_else(|| "?".into());
+    let hkbd_record_type = diagnostic_ram_u32(uc, 0x301c_e2fc)
+        .and_then(|record| diagnostic_ram_u16(uc, u64::from(record) + 2))
+        .unwrap_or(u16::MAX);
+    let hkbd_record_index = diagnostic_ram_u32(uc, 0x301c_e2fc)
+        .and_then(|record| diagnostic_ram_u16(uc, u64::from(record) + 4))
+        .unwrap_or(u16::MAX);
+    let hkbd_record_key = diagnostic_ram_u32(uc, 0x301c_e2fc)
+        .and_then(|record| diagnostic_ram_u16(uc, u64::from(record) + 6))
+        .unwrap_or(u16::MAX);
+    let hkbd_config_index = match hkbd_record_type {
+        0 => hkbd_record_index,
+        3 => 3,
+        _ => u16::MAX,
+    };
+    let hkbd_config_value = if hkbd_config_index == u16::MAX {
+        u8::MAX
+    } else {
+        diagnostic_ram_u8(uc, 0x301c_e2c8 + u64::from(hkbd_config_index))
+            .unwrap_or(u8::MAX)
+    };
+    let hkbd_mailbox_processes = diagnostic_ram_read(uc, 0x301c_e2bd, 3)
+        .map(|bytes| diagnostic_hex(&bytes)).unwrap_or_else(|| "?".into());
+    let hkbd_mailbox_counts = diagnostic_ram_read(uc, 0x301c_e2e6, 6)
+        .map(|bytes| diagnostic_hex(&bytes)).unwrap_or_else(|| "?".into());
+    let hkbd_mailbox_limits = diagnostic_code_or_ram_read(uc, 0x20a8_e91c, 3)
+        .map(|bytes| diagnostic_hex(&bytes)).unwrap_or_else(|| "?".into());
+    let hkbd_mailbox_records = diagnostic_ram_u32(uc, 0x3090_0190)
+        .map(|base| {
+            [0x23u32, 0x3b, 0x50].into_iter().map(|process| {
+                let address = u64::from(base) + u64::from(process) * 0x38;
+                let record = diagnostic_ram_read(uc, address, 0x38)
+                    .map(|bytes| diagnostic_hex(&bytes)).unwrap_or_else(|| "?".into());
+                format!("{process:02x}@{address:08x}:{record}")
+            }).collect::<Vec<_>>().join(",")
+        }).unwrap_or_else(|| "?".into());
+    let hkbd_process_directory = [0x23u64, 0x3b, 0x50].into_iter().map(|process| {
+        let address = 0x3002_eaac + process * 8;
+        let entry = diagnostic_ram_read(uc, address, 8)
+            .map(|bytes| diagnostic_hex(&bytes)).unwrap_or_else(|| "?".into());
+        format!("{process:02x}@{address:08x}:{entry}")
+    }).collect::<Vec<_>>().join(",");
+    let current_rtos_task = diagnostic_ram_u32(uc, 0x3090_0194)
+        .map(|task| {
+            let record = diagnostic_ram_read(uc, u64::from(task), 0x38)
+                .map(|bytes| diagnostic_hex(&bytes)).unwrap_or_else(|| "?".into());
+            format!("{task:08x}:{record}")
+        }).unwrap_or_else(|| "?".into());
+    let rejected_up_override = diagnostic_ram_u8(uc, 0x3040_13a7).unwrap_or(u8::MAX);
+    let filter_caller = if matches!(address, 0x211a_57c0) {
+        key_filter_caller(lr)
+    } else {
+        "-"
+    };
+    let mcc_base = if matches!(address, 0x200d_4cc4 | 0x2111_2a6c | 0x2153_656c) {
+        r0
+    } else if address == 0x211a_57c0 {
+        key_filter_context(lr, r4, r5, r6)
+    } else if matches!(address, 0x200d_4d94 | 0x200d_4d9c | 0x200d_4dcc) {
+        r6
+    } else if matches!(address, 0x2111_2b84 | 0x2111_2b8c) {
+        r4
+    } else if matches!(address, 0x2153_66a0 | 0x2153_66a8) {
+        r5
+    } else {
+        0
+    };
+    let mcc_context = if mcc_base != 0 {
+        diagnostic_ram_read(uc, u64::from(mcc_base) + 0x180, 0x40)
+            .map(|bytes| diagnostic_hex(&bytes)).unwrap_or_else(|| "?".into())
+    } else {
+        "-".into()
+    };
+    let ui_command_gates = if matches!(address, 0x2159_dd48 | 0x2159_dd60 | 0x2159_de34 | 0x2159_defe) {
+        [
+            0x3022_18dc, 0x3022_19c7, 0x3045_0abf, 0x3022_3c0e,
+            0x3022_3c19, 0x3022_3c21, 0x3040_1393, 0x3040_139d,
+            0x3040_13b8, 0x302e_74f7,
+        ].into_iter().map(|gate_address| {
+            let value = diagnostic_ram_u8(uc, gate_address).unwrap_or(u8::MAX);
+            format!("{gate_address:08x}:{value:02x}")
+        }).collect::<Vec<_>>().join(",")
+    } else {
+        "-".into()
+    };
+    eprintln!(
+        "[e830-menu-input] stage={} pc=0x{address:08x} insns={total} r0=0x{r0:08x} r1=0x{r1:08x} r2=0x{r2:08x} r3=0x{r3:08x} r4=0x{r4:08x} r5=0x{r5:08x} r6=0x{r6:08x} sp=0x{sp:08x} lr=0x{lr:08x} object=0x{object:08x}:{object_bytes} indirect={indirect} filter_caller={filter_caller} filter_key=0x{filter_key:08x} filter_key_info=0x{filter_key_info:08x} filter_mask_a=0x{filter_mask_a:08x} filter_mask_b=0x{filter_mask_b:08x} filter_key_offset=0x{filter_key_offset:08x} up_allowed_a=0x{up_allowed_a:08x} up_allowed_b=0x{up_allowed_b:08x} filter_result=0x{filter_result:08x} rejected_up_override=0x{rejected_up_override:02x} keyboard_profile=0x{keyboard_profile:02x} pending_message=0x{pending_message:08x} pipe_gate={pipe_gate:02x} editor_gate={editor_gate:02x} editor_mode={editor_mode:02x} key_block_candidate={gate:02x} gate_ctx={gate_context} hkbd_config={hkbd_config} hkbd_active={hkbd_active} hkbd_key_record={hkbd_key_record} hkbd_record_type=0x{hkbd_record_type:04x} hkbd_record_index=0x{hkbd_record_index:04x} hkbd_record_key=0x{hkbd_record_key:04x} hkbd_config_index=0x{hkbd_config_index:04x} hkbd_config_value=0x{hkbd_config_value:02x} hkbd_mailbox_processes={hkbd_mailbox_processes} hkbd_mailbox_counts={hkbd_mailbox_counts} hkbd_mailbox_limits={hkbd_mailbox_limits} hkbd_mailbox_records={hkbd_mailbox_records} hkbd_process_directory={hkbd_process_directory} current_rtos_task={current_rtos_task} mcc_context={mcc_context} ui_command_gates={ui_command_gates} lk={lk_state}",
+        menu_input_stage(address),
+    );
+    uc.get_data_mut().trace_menu_input_remaining -= 1;
 }
 
 fn advance_dsp_rf(uc: &mut Unicorn<'_, E830State>) {
@@ -874,6 +1257,11 @@ struct E830State {
     watch_pcs: HashSet<u64>,
     watch_after: u64,
     watch_remaining: u64,
+    // Bounded read-only trace for the late menu key path. It samples only
+    // ordinary RAM at proven HKBD/EDP/MMI boundaries and never consumes MMIO.
+    trace_menu_input: bool,
+    trace_menu_input_after: u64,
+    trace_menu_input_remaining: u64,
     // Bounded, read-only task/event snapshots; never changes guest state.
     trace_tasks: bool,
     trace_tasks_after: u64,
@@ -1026,6 +1414,9 @@ impl E830State {
                 }).collect(),
             watch_after: env_u64("E830_WATCH_AFTER").unwrap_or(0),
             watch_remaining: env_u64("E830_WATCH_LIMIT").unwrap_or(1000),
+            trace_menu_input: std::env::var_os("E830_TRACE_MENU_INPUT").is_some(),
+            trace_menu_input_after: env_u64("E830_TRACE_MENU_INPUT_AFTER").unwrap_or(0),
+            trace_menu_input_remaining: env_u64("E830_TRACE_MENU_INPUT_LIMIT").unwrap_or(200),
             trace_tasks: std::env::var_os("E830_TRACE_TASKS").is_some(),
             trace_tasks_after: env_u64("E830_TRACE_TASKS_AFTER").unwrap_or(0),
             trace_tasks_remaining: env_u64("E830_TRACE_TASKS_LIMIT").unwrap_or(1000),
@@ -2791,6 +3182,8 @@ fn install_hooks(cpu: &mut Unicorn<'static, E830State>) -> Result<(), MachineErr
             }
         }
 
+        trace_menu_input_stage(uc, address, total);
+
         if let Some(limit) = uc.get_data().trace_sp_below {
             let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
             let (last_sp, last_pc, after, remaining) = {
@@ -3367,6 +3760,35 @@ fn install_hooks(cpu: &mut Unicorn<'static, E830State>) -> Result<(), MachineErr
     )
     .map_err(|error| unicorn_error("installing the RTOS-nesting trace", error))?;
 
+    cpu.add_mem_hook(
+        HookType::MEM_WRITE,
+        MENU_INPUT_KEY_BLOCK_CANDIDATE,
+        MENU_INPUT_KEY_BLOCK_CANDIDATE,
+        |uc, _, address, size, value| {
+            let total = uc.get_data().instructions
+                .saturating_add(uc.get_data().fast_forwarded_instructions);
+            let should_log = {
+                let state = uc.get_data();
+                state.trace_menu_input
+                    && total >= state.trace_menu_input_after
+                    && state.trace_menu_input_remaining > 0
+            };
+            if should_log {
+                let old = diagnostic_ram_u8(uc, MENU_INPUT_KEY_BLOCK_CANDIDATE)
+                    .unwrap_or(u8::MAX);
+                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+                let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+                eprintln!(
+                    "[e830-menu-input] stage=key-block-write pc=0x{pc:08x} insns={total} addr=0x{address:08x} size={size} old=0x{old:02x} value=0x{value:08x} sp=0x{sp:08x} lr=0x{lr:08x}"
+                );
+                uc.get_data_mut().trace_menu_input_remaining -= 1;
+            }
+            false
+        },
+    )
+    .map_err(|error| unicorn_error("installing the late-menu key-block trace", error))?;
+
     if let Some(start) = env_u64("E830_TRACE_RAM_START") {
         let end = env_u64("E830_TRACE_RAM_END").unwrap_or(start);
         let after = env_u64("E830_TRACE_RAM_AFTER").unwrap_or(0);
@@ -3700,6 +4122,24 @@ mod tests {
     }
 
     #[test]
+    fn menu_input_trace_points_have_unique_stage_names() {
+        let unique: std::collections::HashSet<_> = super::MENU_INPUT_TRACE_PCS.into_iter().collect();
+        assert_eq!(unique.len(), super::MENU_INPUT_TRACE_PCS.len());
+        for pc in super::MENU_INPUT_TRACE_PCS {
+            assert_ne!(super::menu_input_stage(pc), "unknown");
+        }
+        assert_eq!(super::menu_input_stage(0), "unknown");
+        assert_eq!(super::key_filter_caller(0x200d_4d99), "mcc-getkey-accept-reject-s");
+        assert_eq!(super::key_filter_caller(0x2111_2b89), "mcc-getkey-s");
+        assert_eq!(super::key_filter_caller(0x2153_66a5), "mcc-getkey-incall-s");
+        assert_eq!(super::key_filter_caller(0), "other");
+        assert_eq!(super::key_filter_context(0x200d_4d99, 1, 2, 3), 3);
+        assert_eq!(super::key_filter_context(0x2111_2b89, 1, 2, 3), 1);
+        assert_eq!(super::key_filter_context(0x2153_66a5, 1, 2, 3), 2);
+        assert_eq!(super::key_filter_context(0, 1, 2, 3), 0);
+    }
+
+    #[test]
     fn dsp_io_trace_is_bounded_passive_and_separate_from_ram_trace() {
         let mut state = E830State::new(false, vec![0xff; 0x1000],
             Default::default(), Default::default(), Default::default(), Default::default());
@@ -3838,6 +4278,9 @@ mod tests {
         assert_eq!(super::diagnostic_ram_read(cpu, u64::from(crate::RAM_BASE) - 1, 4), None);
         assert_eq!(super::diagnostic_ram_read(cpu,
             u64::from(crate::RAM_BASE) + crate::RAM_SIZE as u64 - 2, 4), None);
+        assert!(super::diagnostic_code_or_ram_read(cpu, u64::from(crate::FLASH_BASE), 4).is_some());
+        assert_eq!(super::diagnostic_code_or_ram_read(cpu, super::EXTERNAL_FLASH_WINDOW_BASE, 4), None);
+        assert_eq!(super::diagnostic_code_or_ram_read(cpu, super::SOC_TIMER, 4), None);
     }
 
     #[test]

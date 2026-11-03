@@ -2739,14 +2739,19 @@ The first two words of the process record at `0x3002a1ac` retain the last
 dispatched tables; they must not be mistaken for the node's current state.
 The standby node at `0x3197f3bc` still selects `0x21717f98`.
 
-The next lead is the **empty UI callback queue**, not unscheduled HKBD/standby.
-It has 20 entries of 0x1c bytes at `0x302d3b80..0x302d3daf`, with callback
-pointer at entry+0x10 and suspended marker at +0x18. Both the pre-scan RAM
-snapshot and the 300M snapshot are all zero. Flags at `0x3036c10c` are
+The next lead initially appeared to be an **empty UI callback queue**, not
+unscheduled HKBD/standby. The object at `0x302d3b80..0x302d3daf` has 20 entries
+of 0x1c bytes, and both the pre-scan RAM snapshot and the 300M snapshot are all
+zero. Flags at `0x3036c10c` are
 `0x20000000`, so bit `0x100` is clear and standby takes the scan path. The
 focused scan trace skips all 20 entries through `0x20157a84`; none can call
 a UI callback. This does **not yet prove** why registrations are absent or
 whether this queue must be populated to draw the main menu.
+
+Later cross-build naming corrected this interpretation: the matching D500
+object is `a_StoredMsgInfoTable`, part of `lk5` saved-message handling, not the
+active menu key queue. The measurements below remain valid observations of
+that table and its users, but they are no longer evidence for the Up-key bug.
 
 Candidate producer `0x215b8c50` inserts a queue record;
 `0x215b8bd0` compacts the queue; `0x20587db0` releases/clears nonzero callback
@@ -3632,3 +3637,221 @@ digit payload with the ignored direction payload. Proof:
 `late-digit-ui-v88.log/.mmio` and `late-up-ui-v89.log/.mmio` under
 `proof/native-windows`. The private traces are diagnostic artifacts and are not
 part of the public repository.
+
+### Checkpoint — 2026-11-02: static EDP consumer boundary and focused late-input trace
+
+The local E830 DEF and CLA now move the investigation beyond the generic send
+routine without publishing either input. `PROCESS_HKBD` is 34 (`0x22`),
+`PROCESS_EDP` is 59 (`0x3b`), and `0x2203` is
+`MOBI_HKBD_KEY_PRESSED_IND`. At the proven press path, `0x214d90c4` therefore
+sends the payload from HKBD to EDP. EDP state table `0x20aa5fbc` maps message
+`0x2203` to callback `0x20d75404`.
+
+Names recovered from the supplied D500 MAP, then checked against the E830 code
+shape and state table, identify `0x20d75404` as the E830 equivalent of
+`edp0_1PipeKeyPressed` and `0x20d76304` as the equivalent of
+`edp0_6DiffuseKbdEvents`. D500 addresses were not transferred, and the complete
+MAP remains local. The E830 path transforms the HKBD event into
+`APPI_EDP_KEY_PRESSED_IND` (`0x3b5b`) before MMI processing. A working digit can
+take a direct application-notification branch; direction key `0x14` instead
+depends on the diffusion path.
+
+The `0x14` comparison in `edp0_1PipeKeyPressed` selects an alternate/editor
+route rather than proving a drop. The D500 name `edp2_51NoDiffAppiMessages`
+matches the role and compact shape of E830 routine `0x20559318`, but static E830
+decoding now excludes it as the ordinary-menu cause: it first requires
+`[0x3036c108] == 8`, and nearby firmware strings name state 8
+`MMI_STATE_JAVA`. Only that Java state can combine with RAM byte `0x3048c264`
+to release the event object at `0x20d7632a`. The Samsung menu should continue
+through `0x20d7634e`, leaving MMI keyboard configuration and key filtering as
+the leading boundary.
+
+Correction: `0x302d3b80` is not an active UI action queue. The D500 MAP names
+the matching 20-by-`0x1c` object `a_StoredMsgInfoTable`, and the E830 call shape
+places it in `lk5` saved-message handling. The previous empty-table observation
+therefore says nothing about ordinary menu navigation.
+
+The stronger MMI path is now `0x2119fe50` (`lk1_1rout_fsm` equivalent),
+`0x20156e80` (`lk2_set_keyboard` equivalent) and `0x211a57c0..0x211a599e`
+(`lk2_33key_in_filter` equivalent). `lk2_set_keyboard` stores the active profile
+at `0x3040067c` and sends `APPI_EDP_CHANGE_KBD_CONFIG_REQ` (`0x3b68`). The key
+EDP table routes that request to `0x21582028`, which forwards its payload to
+HKBD as `MOBI_HKBD_CONFIG_REQ` (`0x2201`) at `0x21582042`. The key filter has
+an explicit jump-table branch at `0x211a593a` for normalized key
+`0x14`, testing keyboard-mask bits before returning its decision.
+
+The `MCFN_MCC_GETKEY_ACCEPT_REJECT_S` caller at `0x200d4d94` establishes the
+return convention:
+filter result 1 continues normal handling, while other values reach the
+rejected-key path at `0x200d4dcc`. Digit `1` tests mask bit 3; Up (`0x14`) tests
+bit 17. The same menu parser installs the source masks at `0x200d4cc4` and then
+requests keyboard profile 4 or 5. A stale or incorrectly delivered profile is
+therefore one possible downstream cause, although the actual late-menu mask
+values still require a paired runtime trace.
+
+Final field-order check: generic HKBD sender `0x215a614c` stores its third
+argument at event `+9` as `keyInfo` and its second argument at `+0xa` as the
+digit/key offset. Short-release site `0x20140efe` passes `r3=2`. EDP builder
+`0x205585e4` then orders source bytes `+8/+9/+0xa` as outgoing
+`key/key_info/key_offset`. R1 at the shared filter is therefore `key_info`, and
+the fifth stack argument is `key_offset`. For Up the predicate is
+`mask_a.bit17 && (key_offset != 1 || mask_b.bit17)`. The passive diagnostic
+records both fields, both masks, both Up bits and the final result.
+
+The late direction trace already proves Up enters the generic sender with its
+second argument zero (`record+2 == 0`). In the `0x2204` branch at `0x215a6240`,
+that selects the special direction encoding: `record+6` becomes payload key
+`+8`, while payload `+0xa` is explicitly zeroed. EDP carries that byte to
+`3b53 +0xc`, proving ordinary Up has `key_offset=0`. Mask B therefore does not
+participate; only mask A bit 17 decides acceptance.
+
+When `MCC_GETKEY_S` accepts a key, `0x21112b96` forwards it to common UI
+dispatch. That dispatcher has an explicit Up case at `0x215b8a30`, mapping
+semantic key `0x14` to command `0xce`. Up is therefore not designed as a no-op
+at this consumer; failure before this point is a real delivery/filter problem.
+
+Command `0xce` enters common UI dispatcher `0x2159dd48`, which has several
+firmware-state gates before its action call at `0x2159de34` (plus alternate
+paths). The passive trace now covers entry, early return and action invocation,
+so it also detects a downstream UI suppression after a successful key filter.
+
+Cross-build table ordering identifies two other callers of the same filter:
+`0x21112b34` is `MCFN_MCC_GETKEY_S`, and `0x2153667c` is
+`MCFN_MCC_GETKEY_INCALL_S`. Static code alone does not prove which MCFN command
+owns the visible `Messages / Select / Back` screen. The trace now classifies
+the universal filter entry by LR instead of assuming the accept/reject caller.
+
+Correction: the two key masks are fields of the dynamic MCFN command object at
+`+0x1b0/+0x1b8`, not globals in `0x302e7714`. The object base is R6 for
+accept/reject, R4 for `GETKEY_S`, and R5 for `GETKEY_INCALL_S`. The universal
+filter trace now selects the base by LR and dumps `+0x180..+0x1bf`; no stale-RAM
+claim is made without that runtime value.
+
+Further static decoding identifies `0x21112a6c` as the `MCC_GETKEY_S` setup and
+`0x2153656c` as the analogous `MCC_GETKEY_INCALL` setup. Each packs active
+descriptor halfwords `+2/+4` directly into mask A at command object `+0x1b0`.
+The passive trace captures descriptor and destination context before this copy,
+so a clear Up bit can be attributed either to intended scenario data or to an
+earlier wrong-descriptor selection.
+
+For ordinary short/release Up, `key_info=2` and the direction encoding proves
+`key_offset=0`. Mask B does not participate; only mask A bit 17 decides
+acceptance. `MCC_GETKEY_S` loads mask A directly from the active scenario
+descriptor. Therefore the emulator must not patch that bit. The remaining
+in-scope causes are missing `0x2204/0x3b53` delivery, a descriptor whose mask A
+rejects Up, or an earlier emulation error that selected the wrong MCFN
+command/descriptor.
+
+Further static decoding corrects the scope of that filter. It handles
+`APPI_EDP_KEY_INFO_IND` (`0x3b53`), not immediate pressed indication `0x3b5b`.
+MMI consumes `0x3b5b` at `0x211a08b6`; Up reaches the distinct direction path
+at `0x211a27e6`. HKBD's later short/release logic emits
+`MOBI_HKBD_KEY_INFO_IND` (`0x2204`) at `0x20140efe`; EDP consumes it at
+`0x205579b8`, builds `0x3b53` at `0x205585e4`, and forwards it at
+`0x2055864c`. The next paired trace must first prove whether Up produces this
+second-stage event before blaming the MMI mask itself.
+
+The generic HKBD sender's actual `0x2204` queue call is `0x215a6266`, distinct
+from the earlier `0x2203` queue call at `0x215a6236`. The passive trace now
+captures both the request at `0x20140efe` and the completed payload immediately
+before its HKBD-to-EDP queue insertion at `0x215a6266`.
+
+### Checkpoint — 2026-11-03: true navigation consumer narrowed
+
+Static decoding establishes that the active-menu mask filter is driven by
+`APPI_EDP_KEY_INFO_IND` (`0x3b53`), not directly by the already proven
+`APPI_EDP_KEY_PRESSED_IND` (`0x3b5b`). HKBD can emit the corresponding
+`MOBI_HKBD_KEY_INFO_IND` (`0x2204`) from its short/release processing; EDP then
+builds and forwards `0x3b53`. The earlier late Up trace stopped after proving
+the `0x2203/0x3b5b` path, so it cannot establish whether the active menu ever
+received Up as `KEY_INFO`.
+
+No contact-lifetime change is justified yet. Existing historical probes used
+different screens and hold intervals; they cannot prove that increasing the
+late-menu GUI hold fixes Up. The worker remains unchanged. The next paired
+trace must compare digit and Up at `0x20140efe`, `0x205579b8`, `0x205585e4`
+and universal filter entry `0x211a57c0`, recording its caller, mask A/B,
+key_info and result before any behavioral change.
+
+Static decoding adds an earlier and more likely `0x2204` boundary. HKBD loads
+the active 8-byte key record from `[0x301ce2f4+8]`. Record type 3 selects
+configuration slot 3; record type 0 selects the slot at record `+4`. Only slot
+values 2 or 4 reach `0x20140ec4`; all other types/values branch to
+`0x20140f1a` without sending `0x2204`. The menu trace now records key-record
+fields `+2/+4/+6`, selected slot/value and both branch destinations. A previous
+post-animation Down run emitted `0x2204`, so the release hardware path works in
+at least one screen/configuration; the active menu may instead have stale or
+wrong keyboard configuration.
+
+HKBD state table entry `0x20a8e88c` maps `MOBI_HKBD_CONFIG_REQ` (`0x2201`) to
+handler `0x20d9221c`. The handler reads a pair count from payload `+9` and
+copies each `(slot,value)` pair beginning at `+0xa` directly into
+`0x301ce2c8`, ignoring only slots `>=0x1b`. The trace now captures the full
+payload on entry and the complete post-copy configuration at `0x20d9225a`.
+This tests whether the active menu sent the wrong profile data or whether the
+correct `3b68 -> 2201` update failed to reach HKBD before release.
+
+New opt-in `E830_TRACE_MENU_INPUT` diagnostics cover these exact HKBD, EDP and
+MMI boundaries, dump only ordinary RAM, report keyboard profile/config sends
+and the complete `0x2204 -> 0x3b53` route, record every write to the
+`0x3048c264` Java-only gate, and are bounded by `_AFTER` and `_LIMIT`. They do
+not read MMIO, modify guest state, inject a message or alter keypad handling.
+The trace now also covers the three release-gate comparisons at `0x20140edc`
+and their decision at `0x20140ef0`. D500 cross-build names resolve helper
+`0x2001eb3e` as `RtkNumberMsgInMailBox`, selector table `0x20a8ea9c` as
+`a_hkbd_ProcessToScan`, and limits `0x20a8e91c` as `a_hkbd_MaxMailbox`. E830
+code and data agree: it checks HSC/EDP/HBAT (`0x23/0x3b/0x50`) mailbox counts
+against `40/10/10`; any full mailbox skips `0x2204`. This is not a duration,
+hardware-timer, keypad-MMIO or I2C check. If it fires in the late menu, the
+emulator-owned lead is RTOS queue consumption/scheduling, not contact lifetime.
+The passive trace now dumps the full `0x38`-byte HSC, EDP and HBAT process
+records at this boundary, not only the three summed mailbox counts.
+It also records their entries from process directory
+`0x3002eaac + process*8`, so a full mailbox can be tied to its task group.
+
+The identical scan on the press path is now traced at
+`0x20140c1e/0x20140c3e`. Because the existing Up trace proves `0x2203` was
+sent, those counts were below their limits before the press. RTOS receive at
+`0x208476ca..0x20847724` decrements the recipient's mailbox count before its
+state-table callback, and the existing trace reaches EDP callback `0x20d75404`.
+Thus the processed Up press itself cannot remain as EDP's tenth message at
+release. The paired scan still tests later EDP traffic and HSC/HBAT
+backpressure, but the simple EDP `9 -> 10` case is no longer the leading cause.
+Static source table `0x205eaa28 + process*8`, copied into that directory during
+initialization, maps HSC to task group 2, EDP to group 4 and HBAT to group 1.
+Therefore an EDP count of 10 narrows the emulator-owned scheduler lead to task
+group 4 rather than the previously investigated UI task 15. The menu trace now
+also includes the current RTOS task record at every sampled boundary.
+Static extraction of the immutable HKBD key-record table at `0x201cbf94` now
+fixes the Up record at `0x201cc044`: physical `0x0108`, key offset zero,
+configuration slot 20 and semantic key `0x14`. HKBD initialization `0x215a5f60`
+clears the configuration array, and the profile-4 branch `0x2015708c` writes
+`4,11,12=1`, `18,19=0`, `6,7=3` without touching slot 20. Profile 5 at
+`0x201570e6` likewise writes `5,11,12=1`, `18,19=3` without slot 20. A stale
+zero for slot 20 therefore explains the observed release rejection without
+requiring a firmware patch or event injection; the runtime trace must still
+prove the active branch and actual slot value first. Diagnostic coverage now
+includes profile-4/5 branch entries and the key-record lookup at `0x215a5fc0`.
+
+The next paired run must identify the first missing or differing boundary and
+then confirm visible navigation after an emulator-owned fix. No build or
+runtime test was performed for this checkpoint at the user's request.
+
+### Checkpoint — 2026-11-03: static decode of the HKBD config builder and profile map
+
+The `0x2201` configuration builder `0x20e008e8` was decoded against its
+consumer `0x20d9221c`. The payload format is `(value, slot count, slots...)`,
+not `(slot,value)` pairs; every `lk2_set_keyboard` call site agrees with the
+builder order. The complete key-record table is at `0x201cbf94` (27 x 8B;
+`physical,type,slot,key`), with Up = record 22 (slot 20), Down = record 21
+(slot 21), Left = 22, Right = 23.
+
+The static bodies of profiles 2..20 were decoded from the jump table at
+`0x20156f24`. Only profile 18 writes slot 20 (Up) with the release-valid value
+`2`; no profile writes slot 21 (Down) with `2/4`. The release gate
+`0x20140e9c` still requires slot `2` or `4`. Because Down is reported working,
+the active menu profile and the real `0x301ce2c8[20]/[21]` byte values are the
+remaining unknown; that requires the runtime trace, not more static decoding.
+A second HKBD slot-clearing loop was found at `0x20989e58` (all 27 slots,
+bound `0x1b`); order relative to profile writes must be captured in the same
+trace.
