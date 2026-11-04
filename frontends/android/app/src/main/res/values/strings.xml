@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Samsung E830 Emulator</string>
+    <string name="library_title">Samsung E830</string>
+    <string name="library_subtitle">Firmware library</string>
+    <string name="empty_title">No firmware imported</string>
+    <string name="empty_body">Import one .cla file, one .nsf file, and optionally a .tfs package. Firmware is not included with the app.</string>
+    <string name="import_firmware">Import firmware</string>
+    <string name="import_in_progress">Copying and validating firmware…</string>
+    <string name="import_success">Imported %1$s</string>
+    <string name="import_failed">Import failed: %1$s</string>
+    <string name="firmware_title">Samsung SGH-E830</string>
+    <string name="lcd_size">176 × 220 LCD</string>
+    <string name="keypad_note">Keypad input is not emulated.</string>
+    <string name="firmware_options">More firmware options</string>
+    <string name="run_firmware">Run firmware</string>
+    <string name="nand_missing">OneNAND: no image (erased flash)</string>
+    <string name="nand_present">OneNAND image selected</string>
+    <string name="nand_auto">Use automatic OneNAND</string>
+    <string name="nand_select">Select physical OneNAND…</string>
+    <string name="nand_select_title">Select a physical E830 OneNAND image</string>
+    <string name="nand_hint">Accepted sizes: 32 MiB main-only or 1024+32 bytes per page. A .tfs package is not a NAND dump.</string>
+    <string name="source_files_untouched">Imported files are copied privately; originals are never modified.</string>
+    <string name="remove_firmware">Remove firmware set</string>
+    <string name="remove_title">Remove firmware?</string>
+    <string name="remove_message">Remove %1$s from this app? Source files are not changed.</string>
+    <string name="cancel">Cancel</string>
+    <string name="remove">Remove</string>
+    <string name="select_nand_error">Import firmware before selecting OneNAND.</string>
+    <string name="fullscreen">Fullscreen</string>
+    <string name="exit_fullscreen">Exit fullscreen</string>
+    <string name="back_to_library">Back to library</string>
+    <string name="waiting_for_frame">Waiting for the firmware to draw its first LCD frame…</string>
+    <string name="emulator_starting">Starting Samsung SGH-E830 firmware…</string>
+    <string name="emulator_stopped_background">Stopped while the app was in the background.</string>
+    <string name="lcd_description">Live E830 firmware LCD</string>
+    <string name="display_status">Experimental firmware model. The real main menu has not been reached; keypad input is not emulated.</string>
+    <string name="choose_firmware_files">Choose .cla, .nsf, and optional .tfs files</string>
+    <string name="choose_firmware_error">Select one .cla, one .nsf, and at most one .tfs file.</string>
+    <string name="choose_nand_error">Select a 32 MiB main-only or 34,603,008-byte interleaved NAND image.</string>
+    <string name="library_error">Could not read firmware library: %1$s</string>
+    <string name="file_too_large">Selected file is larger than 128 MiB.</string>
+    <string name="nand_auto_description">Use the OneNAND file next to the CLA image, if present, or erased flash.</string>
+    <string name="lcd_not_emulated">No LCD frame has been drawn by the firmware yet.</string>
+    <string name="firmware_picker_description">Choose the E830 firmware image and EEPROM, plus an optional TFS installer package.</string>
+</resources>

@@ -6,6 +6,8 @@ Library/Settings, Run output, LCD с масштабом до 2×, FPS и F11.
 Удалены загрузчики приложений Windows CE/Windows Mobile, библиотека игр,
 CAB/PE, WinCE API, игровой звук, GLES и виртуальный игровой геймпад.
 
+Экспериментальный Android-порт для ARM64, включая сборку APK и ограничения запуска, описан в [`frontends/android/README.md`](frontends/android/README.md).
+
 ## Запуск на Windows
 
 В готовой папке сборки запустите `e830-emulator.exe`. Нажмите `Run` на карточке
