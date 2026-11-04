@@ -34,3 +34,12 @@ __pycache__/
 *.out
 *.zip
 *.7z
+
+/frontends/android/.gradle/
+/frontends/android/.kotlin/
+/frontends/android/local.properties
+/frontends/android/build/
+/frontends/android/app/build/
+/frontends/android/native/target/
+/frontends/android/app/src/main/assets/firmware/
+/frontends/android/app/src/main/assets/rom/

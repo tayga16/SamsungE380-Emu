@@ -1,0 +1,3 @@
+# cmake-rust must use the NDK toolchain so Unicorn selects the Android ARM64 build.
+[env]
+CMAKE_TOOLCHAIN_FILE_aarch64-linux-android = { value = "frontends/android/build-support/cmake/android-arm64-v8a.toolchain.cmake", relative = true, force = false }

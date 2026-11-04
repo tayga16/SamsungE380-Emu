@@ -1,6 +1,9 @@
+extern crate self as e830;
+
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
+pub mod runner;
 
 pub const FLASH_BASE: u32 = 0x2000_0000;
 pub const RAM_BASE: u32 = 0x3000_0000;
