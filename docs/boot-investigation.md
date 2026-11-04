@@ -1,6 +1,6 @@
 ﻿# E830: current native Windows boot investigation
 
-Updated 2026-11-01. This file describes the standalone Rust/Unicorn model.
+Updated 2026-11-04. This file describes the standalone Rust/Unicorn model.
 The old QEMU, forced-IRQ and clock-acceleration notes are archived in
 [boot-investigation-legacy.md](boot-investigation-legacy.md); they contain
 superseded conclusions and must not guide the current board implementation.
@@ -11,7 +11,8 @@ the Library now also offers an explicit physical NAND image selector.
 
 The original E830XEGG1 firmware draws its SGH-E830/Samsung splash, creates the
 RTOS system stack and unmasks IRQs itself. Application-menu navigation is not
-verified. A complete
+verified unless noted; with the menu-key HLE fix below, SoftLeft opens the
+application list and Up reaches UI dispatch (`0x68`). A complete
 TFS image is now installed and verified through a fresh original loader process.
 Retail E830 BML initialization and FAT mounting also succeed on that image.
 The default DSP boot interface reaches the DSP-start handshake described below;

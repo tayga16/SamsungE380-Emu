@@ -1,6 +1,6 @@
 # E830 late-menu HKBD input slice
 
-Status: trace-backed producer plus static E830 consumer slice, 2026-11-03.
+Status: runtime-confirmed producer/consumer slice plus HLE Up fix, 2026-11-04.
 Firmware images, full DEF/MAP files and private traces are intentionally omitted.
 
 ## Established path
@@ -522,5 +522,49 @@ Additional static anchors found while testing that hypothesis:
   hard facts are the two consumer functions `0x20d92134`/`0x20d9221c`, which
   are confirmed by direct `0x2201` handling code.
 
-The release gate, mailbox backpressure scan and the profile/slot question are
-now all statically mapped; the single remaining unknown is runtime state.
+## Runtime confirmation and HLE fix
+
+The live trace (working `E830XEGG1.onenand.bin`, 950M instructions, SIM + DSP
+RF/battery HLE environment) resolves the remaining runtime question and
+proves the gate mechanism:
+
+- At `insns=320910363` the selector requests profile 1
+  (`keyboard_profile=0x01`), and the shared fallback body
+  (`0x20157586`) writes `0x301ce2c8[20] = 3` through the `0x2201` consumer
+  (`0x20d9221c`, final slot store `strb r7,[r1,r0]` at `0x20d9224c`, loop exit
+  at `0x20d92258`).
+- Up press at `insns=921008859` hits the press gate with
+  `hkbd_record_index=0x14` and `hkbd_config_value=0x03`; the gate rejects the
+  `0x2204` path, exactly as predicted.
+- Profile 18 (the only profile that writes slot 20 = 2) is never selected in
+  the live menu; the menu keeps profile 1 / fallback.
+
+### Emulator-owned HLE fix
+
+The emulator rewrites the known-bad value in ordinary guest RAM immediately
+after HKBD has applied a configuration request. In the per-instruction hook,
+at `0x20d9225a` (the `pop` that returns from the `0x2201` consumer; all slot
+stores have already executed), if `0x301ce2c8[20] == 3` it is rewritten to
+`0`:
+
+```text
+[e830-hkbd-hle] up slot=20 blocked=3 -> allowed=0 count=1
+```
+
+The value `0` passes both HKBD gates (`0x20140c68` press path, and the
+release/short path), so the original firmware sends `MOBI_HKBD_KEY_INFO_IND`
+(`0x2204`) itself. No firmware byte is patched, no UI event is injected and
+no key is remapped. Only slot 20 is touched, and only when it equals the
+known blocking value `3`.
+
+Verified run `fixverify5`:
+
+| step | insns | observation |
+| --- | ---: | --- |
+| Up press gate | 921008859 | `hkbd_config_value=0x00` (was `3`), accepted |
+| HKBD → EDP `0x2204` | 921009042 | `stage=hkbd-key-info-to-edp` |
+| EDP → `0x3b53` | 921030935 | `stage=edp-key-info-forward`, `r0=0x3b53` |
+| UI dispatch | 921082708 | `stage=ui-command-entry`, direction key Up (`r6=0x14`) |
+
+SoftLeft still reaches UI dispatch (`0xc8`) unchanged, and all 186 unit tests
+pass with the hook active.

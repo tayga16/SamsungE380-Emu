@@ -66,6 +66,13 @@ const SECONDARY_TIMER_IRQS: [u32; 2] = [18, 17];
 // independently, use the same observed/provisional ARM ratio as SOC_TIMER.
 const SECONDARY_TIMER_CPU_CLOCK_RATIO: u64 = 8;
 const SECONDARY_TIMER_COMPARE_OFFSETS: [u32; 4] = [0x0c, 0x10, 0x14, 0x18];
+// HKBD copies profile configuration to this array. Slot 20 belongs to Up and
+// profile 1 (the menu fallback profile) writes the blocking value 3 there.
+const HKBD_CONFIG_BASE: u64 = 0x301c_e2c8;
+const HKBD_UP_CONFIG_SLOT: u64 = 20;
+// Press and release gates accept this value, so HKBD itself sends 0x2204.
+const HKBD_UP_CONFIG_BLOCKED: u8 = 3;
+const HKBD_UP_CONFIG_ALLOWED: u8 = 0;
 const SECONDARY_TIMER_CONTROL_BITS: [u32; 4] = [0x08, 0x20, 0x80, 0x200];
 const SECONDARY_TIMER_STATUS_BITS: [u32; 4] = [0x02, 0x04, 0x08, 0x10];
 const SYSTEM_TIMER_IRQ: u32 = 20;
@@ -172,7 +179,7 @@ const KEYBOARD_INIT_TABLE: u32 = 0x20e8_2eac;
 const STANDBY_LOOK_TABLE: u32 = 0x2171_7f98;
 const STATE_TABLE_DISPATCH_PC: u64 = 0x2084_78f2;
 const MENU_INPUT_KEY_BLOCK_CANDIDATE: u64 = 0x3048_c264;
-const MENU_INPUT_TRACE_PCS: [u64; 60] = [
+const MENU_INPUT_TRACE_PCS: [u64; 66] = [
     0x215a_6236, // HKBD sends MOBI_HKBD_KEY_PRESSED_IND to EDP.
     0x20d7_5404, // EDP key-press pipe entry.
     0x20d7_547c, // EDP direct APPI_EDP_KEY_PRESSED_IND route.
@@ -233,6 +240,12 @@ const MENU_INPUT_TRACE_PCS: [u64; 60] = [
     0x2159_dd60, // Common UI command dispatcher early return.
     0x2159_de34, // Common UI command dispatcher invokes the selected action.
     0x2159_defe, // Alternate common UI action invocation.
+    0x2098_9e58, // HKBD clear: zeroes all 27 config slots (loop bound 0x1b).
+    0x208e_51ac, // IRQ16 keypad handler entry; release source events arrive here.
+    0x208a_74d0, // keypad callback post-release: physical-to-record resolve.
+    0x208a_703c, // keypad callback post-release: sends resolved key to HKBD.
+    0x2014_0c68, // HKBD press gate: reads active key record and config slot.
+    0x2014_0d54, // HKBD release/short alternate handler (sends 0x2204/0x220e class).
 ];
 const RTOS_TASK_TRACE_PCS: [u64; 9] = [
     0x2084_7660, // receive: task group in r7, request in r5
@@ -291,6 +304,32 @@ fn diagnostic_ram_u16(uc: &Unicorn<'_, E830State>, address: u64) -> Option<u16> 
     diagnostic_ram_read(uc, address, 2)
         .and_then(|bytes| bytes.try_into().ok())
         .map(u16::from_le_bytes)
+}
+
+/// Emulator-side workaround for the E830 menu keyboard profile.
+///
+/// Profile 1, selected for menu-like UI states, writes the blocking value `3`
+/// to HKBD's configuration slot 20. The native press/release gates then reject
+/// Up before it can produce `MOBI_HKBD_KEY_INFO_IND` (`0x2204`). After HKBD
+/// finishes applying a profile, replace only that known-bad value with the
+/// value used by working navigation keys. The firmware path and all other
+/// slots are left untouched.
+fn hkbd_hle_unblock_up(uc: &mut Unicorn<'_, E830State>) {
+    let address = HKBD_CONFIG_BASE + HKBD_UP_CONFIG_SLOT;
+    let Some(value) = diagnostic_ram_u8(uc, address) else {
+        return;
+    };
+    if value != HKBD_UP_CONFIG_BLOCKED {
+        return;
+    }
+    if uc.mem_write(address, &[HKBD_UP_CONFIG_ALLOWED]).is_ok() {
+        uc.get_data_mut().hkbd_up_unblocked += 1;
+        eprintln!(
+            "[e830-hkbd-hle] up slot={} blocked={} -> allowed={} count={}",
+            HKBD_UP_CONFIG_SLOT, value, HKBD_UP_CONFIG_ALLOWED,
+            uc.get_data().hkbd_up_unblocked
+        );
+    }
 }
 
 fn menu_input_stage(address: u64) -> &'static str {
@@ -355,6 +394,12 @@ fn menu_input_stage(address: u64) -> &'static str {
         0x2159_dd60 => "ui-command-early-return",
         0x2159_de34 => "ui-command-action",
         0x2159_defe => "ui-command-action-alternate",
+        0x2098_9e58 => "hkbd-clear-all-config",
+        0x208e_51ac => "keypad-irq16-entry",
+        0x208a_74d0 => "keypad-release-resolve",
+        0x208a_703c => "keypad-release-send",
+        0x2014_0c68 => "hkbd-press-gate-record",
+        0x2014_0d54 => "hkbd-release-short-alternate",
         _ => "unknown",
     }
 }
@@ -1183,6 +1228,7 @@ struct E830State {
     lcd_frames: u64,
     keyboard_init_dispatches: u64,
     standby_look_dispatches: u64,
+    hkbd_up_unblocked: u64,
     timer_counter: u16,
     timer_last_update: u64,
     timer_clock_remainder: u64,
@@ -1343,6 +1389,7 @@ impl E830State {
             lcd_frames: 0,
             keyboard_init_dispatches: 0,
             standby_look_dispatches: 0,
+            hkbd_up_unblocked: 0,
             timer_counter: 0,
             timer_last_update: 0,
             timer_clock_remainder: 0,
@@ -3184,6 +3231,10 @@ fn install_hooks(cpu: &mut Unicorn<'static, E830State>) -> Result<(), MachineErr
 
         trace_menu_input_stage(uc, address, total);
 
+        if address == 0x20d9_225a {
+            hkbd_hle_unblock_up(uc);
+        }
+
         if let Some(limit) = uc.get_data().trace_sp_below {
             let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
             let (last_sp, last_pc, after, remaining) = {
@@ -4280,7 +4331,7 @@ mod tests {
             u64::from(crate::RAM_BASE) + crate::RAM_SIZE as u64 - 2, 4), None);
         assert!(super::diagnostic_code_or_ram_read(cpu, u64::from(crate::FLASH_BASE), 4).is_some());
         assert_eq!(super::diagnostic_code_or_ram_read(cpu, super::EXTERNAL_FLASH_WINDOW_BASE, 4), None);
-        assert_eq!(super::diagnostic_code_or_ram_read(cpu, super::SOC_TIMER, 4), None);
+        assert_eq!(super::diagnostic_code_or_ram_read(cpu, u64::from(super::SOC_TIMER), 4), None);
     }
 
     #[test]
